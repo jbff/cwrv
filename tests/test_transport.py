@@ -35,3 +35,17 @@ def test_unconnected_write_raises():
     link = GatewayLink("10:06:1C:E7:B8:3E")
     with pytest.raises(LinkError):
         link.client
+
+
+def test_relay_states_updated_from_device_status(monkeypatch):
+    # Fake a derived status parser (real one arrives in Task 9)
+    monkeypatch.setattr(
+        GatewayLink,
+        "relay_state_from_status",
+        staticmethod(lambda payload: (payload[0] & 1) == 1 if payload else None),
+    )
+    link = GatewayLink("10:06:1C:E7:B8:3E")
+    # V2 ElevenBit notification: [0x02][..][..][type=DEVICE_STATUS][addr=0x41][dlc=1][status=0x01]
+    status_frame = bytes([0x02, 0x00, 0x00, 0x03, 0x41, 0x01, 0x01])
+    link._on_notification(status_frame)
+    assert link.relay_states[0x41] is True

@@ -3,6 +3,7 @@ from .cobs import CobsByteDecoder, cobs_encode
 from .crc8 import crc8
 from .tea import (
     CAN_BLE_KEY_SEED_CIPHER,
+    RC_CYPHER,
     X180T_KEY_SEED_CIPHER,
     calculate_can_ble_key_seed_key,
     calculate_step1_key,
