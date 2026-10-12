@@ -8,6 +8,7 @@ import click
 from . import __version__, lights, morse
 from .ble.session import RemoteControlSessionError
 from .config import lights_path, load_gateway
+from .protocol import FUNCTION_NAMES
 
 
 @click.group()
@@ -232,6 +233,84 @@ def probe_session(device: int) -> None:
                 return
             click.echo(f"RESULT: SESSION OPEN with 0x{device:02X} (multiplexing works)")
             click.echo("no command frames sent; leaving bus as found")
+
+    asyncio.run(run())
+
+
+def _function_label(function_name: int) -> str:
+    return FUNCTION_NAMES.get(function_name, f"fn 0x{function_name:04X}")
+
+
+@cli.command()
+def discover() -> None:
+    """List relay devices found on the IDS-CAN bus."""
+
+    async def run():
+        from .ble.can import claim_local_host
+        from .ble.session import unlock_gateway
+        from .ble.transport import GatewayLink
+        from .discovery import collect_devices
+
+        link = GatewayLink(load_gateway().mac, load_gateway().pin)
+        await link.connect()
+        try:
+            await unlock_gateway(link)
+            await claim_local_host(link, set())
+            devices = await collect_devices(link, window_s=3.0)
+            for d in devices:
+                click.echo(
+                    f"device 0x{d.address:02X} product={d.product_id} "
+                    f"type={d.device_type} {_function_label(d.function_name)}"
+                )
+        finally:
+            await link.close()
+
+    asyncio.run(run())
+
+
+@cli.command()
+@click.argument("name")
+@click.option("--yes", is_flag=True, help="skip confirmation (save all offered)")
+def learn(name: str, yes: bool) -> None:
+    """Guided toggle-and-observe mapping: NAME gets a device from candidates."""
+
+    async def run():
+        from .ble.can import relay_command, set_relay
+        from .discovery import DiscoveredDevice, collect_devices
+        from .executor import open_gateway
+
+        async with open_gateway(load_gateway()) as (link, rc):
+            candidates: list[DiscoveredDevice] = await collect_devices(
+                link, window_s=3.0
+            )
+            if not candidates:
+                click.echo("no devices found; try again with HA idle", err=True)
+                raise SystemExit(1)
+            for dev in candidates:
+                click.echo(f"toggling device 0x{dev.address:02X} …")
+                try:
+                    await set_relay(link, rc, dev.address, True)
+                    await asyncio.sleep(0.6)
+                    await set_relay(link, rc, dev.address, False)
+                except Exception as exc:
+                    # With the DEVICE_STATUS parser not yet captured (Task 9
+                    # Step 5), confirm misses raise before the OFF half; send a
+                    # best-effort OFF so the walk does not leave lights latched.
+                    click.echo(f"  toggle failed: {exc}", err=True)
+                    if link.local_host_address is not None:
+                        try:
+                            await link.write_can_frame(
+                                relay_command(link.local_host_address, dev.address, False)
+                            )
+                        except Exception:
+                            pass  # link is gone; the gateway drops the session with it
+                    continue
+                if yes or click.confirm(f"Was that {name}?"):
+                    lights.save_light(lights_path(), name, dev.address)
+                    click.echo(f"saved: {name} = 0x{dev.address:02X}")
+                    return
+        click.echo("no device matched", err=True)
+        raise SystemExit(1)
 
     asyncio.run(run())
 

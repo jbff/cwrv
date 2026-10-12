@@ -3,7 +3,7 @@ name = "rvcw"
 version = "0.1.0"
 description = "CW (Morse) blinker for RV panel lights over IDS-CAN BLE"
 requires-python = ">=3.12"
-dependencies = ["bleak>=0.22,<2", "click>=8.1,<9", "tomli-w>=1,<2"]
+dependencies = ["bleak>=0.22,<2", "click>=8.1,<9"]
 
 [dependency-groups]
 dev = ["pytest>=8", "pytest-asyncio>=0.24"]
