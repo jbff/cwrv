@@ -6,7 +6,7 @@ Status: approved in chat 2026-10-12; awaiting spec review
 
 ## Purpose
 
-A standalone CLI (`rvcw`) that blings CW/Morse messages on the RV's OneControl
+A standalone CLI (`rvcw`) that blinks CW/Morse messages on the RV's OneControl
 panel lights by speaking the IDS-CAN BLE protocol directly — no HA in the send
 path — while coexisting with the existing HA integration on the same BLE
 connection.
