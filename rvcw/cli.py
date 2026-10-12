@@ -6,6 +6,7 @@ import asyncio
 import click
 
 from . import __version__, lights, morse
+from .ble.session import RemoteControlSessionError
 from .config import lights_path, load_gateway
 
 
@@ -109,6 +110,44 @@ def sniff() -> None:
         asyncio.run(run())
     except KeyboardInterrupt:
         pass
+
+
+def _parse_device_id(_ctx, _param, value: str) -> int:
+    """Accept decimal and 0x-prefixed hex device ids (plain `int` rejects hex)."""
+    try:
+        return int(value, 0)
+    except ValueError:
+        raise click.BadParameter(
+            f"device id must be an integer like 0x2E41, got {value!r}"
+        ) from None
+
+
+@cli.command("probe-session")
+@click.option(
+    "--device",
+    required=True,
+    callback=_parse_device_id,
+    help="target relay device id (e.g. 0x2E41)",
+)
+def probe_session(device: int) -> None:
+    """Phase-1 gate: second IDS-CAN participant alongside HA. Reports and exits."""
+
+    async def run() -> None:
+        from .executor import open_gateway
+
+        cfg = load_gateway()
+        async with open_gateway(cfg) as (link, rc):
+            click.echo(f"connected mac={cfg.mac} local_host=0x{link.local_host_address:02X}")
+            click.echo(f"frames_received={link.frames_received}")
+            try:
+                await rc.ensure(device)
+            except RemoteControlSessionError as exc:
+                click.echo(f"RESULT: REFUSED — {exc}")
+                return
+            click.echo(f"RESULT: SESSION OPEN with 0x{device:02X} (multiplexing works)")
+            click.echo("no command frames sent; leaving bus as found")
+
+    asyncio.run(run())
 
 
 def main() -> None:
