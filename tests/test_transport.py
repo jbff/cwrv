@@ -22,9 +22,13 @@ def test_v2_twentynine_bit_notification_yields_one_frame():
 
 
 def test_non_v2_bytes_fall_back_to_wire_parse():
-    raw = bytes([0x0F, 0x00, 0x01, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00])
+    # Valid raw 11-bit wire frame: [dlc=6][id 0x832E (type 3, src 0x2E)][6 payload bytes].
+    # First byte 0x06 is outside the V2 notification types (1/2/3).
+    raw = bytes([0x06, 0x83, 0x2E, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06])
     frames = decode_notification(raw)
     assert len(frames) == 1
+    assert frames[0].message_type == 0x03
+    assert frames[0].source_address == 0x2E
 
 
 def test_unconnected_write_raises():

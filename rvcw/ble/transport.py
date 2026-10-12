@@ -17,28 +17,6 @@ class LinkError(RuntimeError):
     pass
 
 
-def _parse_wire_frame_tolerant(raw: bytes) -> IdsCanWireFrame | None:
-    """Parse a raw wire frame, tolerating an unusable dlc byte.
-
-    A notification's total length already pins the frame layout, so when the
-    leading DLC byte is not a plain CAN length, infer it from the remaining
-    bytes (4-byte extended id first, then 2-byte standard id).
-    """
-    frame = parse_ids_can_wire_frame(raw)
-    if frame:
-        return frame
-    if len(raw) < 3:
-        return None
-    remaining = len(raw) - 1
-    for id_len in (4, 2):
-        dlc = remaining - id_len
-        if 0 <= dlc <= 8:
-            frame = parse_ids_can_wire_frame(bytes([dlc]) + raw[1:])
-            if frame:
-                return frame
-    return None
-
-
 def decode_notification(raw: bytes) -> list[IdsCanWireFrame]:
     """Decode one CAN_READ notification into wire frames.
 
@@ -47,7 +25,7 @@ def decode_notification(raw: bytes) -> list[IdsCanWireFrame]:
     """
     raw = bytes(raw)
     if not raw or raw[0] not in (0x01, 0x02, 0x03):
-        frame = _parse_wire_frame_tolerant(raw)
+        frame = parse_ids_can_wire_frame(raw)
         return [frame] if frame else []
     v2 = raw[0]
     if v2 == 0x01:  # Packed: one device advertisement -> 4 synthetic frames
