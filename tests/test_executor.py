@@ -6,8 +6,12 @@ import pytest
 
 from rvcw.protocol import parse_ids_can_wire_frame
 
+from rvcw.ble.transport import LinkError
+from rvcw.config import GatewayConfig
 from rvcw.executor import SendAborted, SendStats, send_steps
 from rvcw.morse import Step
+
+CONFIG = GatewayConfig(mac="FA:KE")  # reconnect fake ignores it
 
 
 class TimelineLink:
@@ -55,11 +59,19 @@ class TimelineLink:
 
 
 class FakeRC:
-    open = True
-    target = None
+    def __init__(self):
+        self.ensured: list[int] = []
+        self.closes = 0
+
+    def handle_frame(self, frame) -> None:  # re-registered after reconnect
+        pass
 
     async def ensure(self, device_id: int) -> bool:
+        self.ensured.append(device_id)
         return True
+
+    async def aclose(self) -> None:
+        self.closes += 1
 
 
 async def test_schedule_write_times_match_elements():
@@ -68,7 +80,8 @@ async def test_schedule_write_times_match_elements():
     rc = FakeRC()  # type: ignore[arg-type]
     # bypass confirm: confirm=False path
     stats = await send_steps(
-        link, rc, [0x2E], [Step(True, 150), Step(False, 150), Step(True, 450)], confirm=False
+        link, rc, [0x2E], [Step(True, 150), Step(False, 150), Step(True, 450)],
+        config=CONFIG, confirm=False,
     )  # type: ignore[arg-type]
     assert isinstance(stats, SendStats)
     on_times = [w[0] for w in link.writes if w[2]]
@@ -88,7 +101,8 @@ async def test_abort_on_two_consecutive_misses():
 
     with pytest.raises(SendAborted):
         await send_steps(
-            link, rc, [0x2E], [Step(True, 150), Step(False, 150)], confirm=True, confirm_timeout=0.05
+            link, rc, [0x2E], [Step(True, 150), Step(False, 150)],
+            config=CONFIG, confirm=True, confirm_timeout=0.05,
         )  # type: ignore[arg-type]
 
 
@@ -96,7 +110,8 @@ async def test_off_restore_when_pre_state_unknown():
     """No DEVICE_STATUS seen pre-send -> the off-guarantee forces OFF."""
     link = TimelineLink()
     stats = await send_steps(
-        link, FakeRC(), [0x2E], [Step(True, 100), Step(False, 100)], confirm=False
+        link, FakeRC(), [0x2E], [Step(True, 100), Step(False, 100)],
+        config=CONFIG, confirm=False,
     )
     on_writes = [w for w in link.writes if w[2]]
     off_writes = [w for w in link.writes if not w[2]]
@@ -111,7 +126,8 @@ async def test_restore_returns_to_known_pre_state():
     link = TimelineLink()
     link.mark(0x2E, True)  # pre-send DEVICE_STATUS says ON
     await send_steps(
-        link, FakeRC(), [0x2E], [Step(True, 100), Step(False, 100)], confirm=False
+        link, FakeRC(), [0x2E], [Step(True, 100), Step(False, 100)],
+        config=CONFIG, confirm=False,
     )
     restores = link.writes[-1]
     assert restores[2] is True  # final write is ON, matching the pre-state
@@ -122,7 +138,8 @@ async def test_rewrite_on_missed_confirm_counts_miss_and_completes():
     one miss counted, consecutive counter reset, send completes, restore off."""
     link = TimelineLink(confirm_on_write_no=2)
     stats = await send_steps(
-        link, FakeRC(), [0x2E], [Step(True, 100), Step(False, 100)], confirm=True, confirm_timeout=0.05
+        link, FakeRC(), [0x2E], [Step(True, 100), Step(False, 100)],
+        config=CONFIG, confirm=True, confirm_timeout=0.05,
     )
     assert stats.misses == 1
     # writes: on, on-rewrite (marks ON), off (marks OFF -> confirmed), restore
@@ -134,7 +151,8 @@ async def test_rewrite_on_missed_confirm_counts_miss_and_completes():
 async def test_rtt_measured_on_first_confirmed_element():
     link = TimelineLink(confirm_on_write_no=1)
     stats = await send_steps(
-        link, FakeRC(), [0x2E], [Step(True, 100), Step(False, 100)], confirm=True, confirm_timeout=0.5
+        link, FakeRC(), [0x2E], [Step(True, 100), Step(False, 100)],
+        config=CONFIG, confirm=True, confirm_timeout=0.5,
     )
     assert stats.rtt_ms is not None
     assert stats.rtt_ms < 50.0  # immediate confirmation ≈ no measurable rtt
@@ -157,7 +175,8 @@ async def test_restore_failure_is_counted_not_raised():
 
     link = DyingLink()
     stats = await send_steps(
-        link, FakeRC(), [0x2E], [Step(True, 100), Step(False, 100)], confirm=False
+        link, FakeRC(), [0x2E], [Step(True, 100), Step(False, 100)],
+        config=CONFIG, confirm=False,
     )
     assert stats.restore_failures == 1
 
@@ -173,7 +192,8 @@ async def test_confirm_latency_does_not_drift_next_write_boundary():
     link = TimelineLink(confirm_on_write_no=1, confirm_delay_s=0.10)
     rc = FakeRC()  # type: ignore[arg-type]
     await send_steps(
-        link, rc, [0x2E], [Step(True, 150), Step(False, 150)], confirm=True, confirm_timeout=0.5
+        link, rc, [0x2E], [Step(True, 150), Step(False, 150)],
+        config=CONFIG, confirm=True, confirm_timeout=0.5,
     )  # type: ignore[arg-type]
     # PINNING-ASSERT (second write lands on its scheduled boundary):
     assert 0.145 <= link.writes[1][0] < 0.17, link.writes
@@ -182,4 +202,91 @@ async def test_confirm_latency_does_not_drift_next_write_boundary():
 async def test_empty_device_ids_rejected():
     link = TimelineLink()
     with pytest.raises(ValueError):
-        await send_steps(link, FakeRC(), [], [Step(True, 100)])
+        await send_steps(link, FakeRC(), [], [Step(True, 100)], config=CONFIG)
+
+
+# ---- spec §Safety "Reconnect" (mid-message BLE loss, resume once) --------
+
+
+class FlakyLink(TimelineLink):
+    """Drops link-level (`LinkError`) after `budget` successful writes until
+    a successful reconnect has happened (`down` cleared by the fake)."""
+
+    def __init__(self, budget: int):
+        super().__init__()
+        self.budget = budget
+        self.down = True
+        self.reconnects = 0
+
+    async def write_can_frame(self, frame: bytes) -> None:
+        if self.budget > 0:
+            self.budget -= 1
+        elif self.down:
+            raise LinkError("mid-schedule BLE loss")
+        await super().write_can_frame(frame)
+
+
+async def test_link_loss_reconnects_once_and_resumes_remaining_schedule(monkeypatch):
+    from rvcw import executor
+
+    link = FlakyLink(budget=2)  # steps 1-2 write ok; step 3's write raises
+    rc = FakeRC()
+    steps = [Step(True, 100), Step(False, 100), Step(True, 100)]
+
+    async def fake_reconnect(glink, config):
+        assert config is CONFIG
+        glink.reconnects += 1
+        glink.down = False  # the "re-established" link works
+
+    monkeypatch.setattr(executor, "reconnect_gateway", fake_reconnect)
+
+    stats = await send_steps(
+        link, rc, [0x2E], steps, config=CONFIG, confirm=False
+    )
+    assert link.reconnects == 1
+    # resumed at the CURRENT position: no step restarted, so each element is
+    # written exactly once (3 element writes) + the off-guarantee restore
+    assert len(link.writes) == 4
+    assert [w[2] for w in link.writes] == [True, False, True, False]
+    assert link.writes[2][0] < 0.25  # the retried element is not re-sequenced
+    assert stats.restore_failures == 0
+    # the RC was re-seeded after the reconnect (session rebuild path)
+    assert rc.closes == 1
+    assert rc.ensured == [0x2E, 0x2E]  # initial ensure, then the re-ensure
+
+
+async def test_second_link_failure_raises_link_error(monkeypatch):
+    from rvcw import executor
+
+    class NoHelpLink(FlakyLink):
+        pass  # `down` never clears: reconnect does NOT fix the write path
+
+    link = NoHelpLink(budget=0)
+
+    async def fake_reconnect(glink, config):
+        glink.reconnects += 1  # claims success, but the link stays dead
+
+    monkeypatch.setattr(executor, "reconnect_gateway", fake_reconnect)
+
+    with pytest.raises(LinkError):
+        await send_steps(
+            link, FakeRC(), [0x2E], [Step(True, 100), Step(False, 100)],
+            config=CONFIG, confirm=False,
+        )
+    assert link.reconnects == 1  # exactly one reconnect attempt, then abort
+
+
+async def test_failed_reconnect_raises_immediately(monkeypatch):
+    from rvcw import executor
+
+    link = FlakyLink(budget=0)
+
+    async def bad_reconnect(glink, config):
+        raise LinkError("reconnect itself failed")
+
+    monkeypatch.setattr(executor, "reconnect_gateway", bad_reconnect)
+
+    with pytest.raises(LinkError, match="reconnect itself failed"):
+        await send_steps(
+            link, FakeRC(), [0x2E], [Step(True, 100)], config=CONFIG, confirm=False
+        )

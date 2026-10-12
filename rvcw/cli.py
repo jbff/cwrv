@@ -73,9 +73,11 @@ def send(text: str, light: str, wpm: int | None, repeat: int, dry_run: bool, no_
     confirm_timeout = max(0.05, (1200 / wpm) / 1000 * 0.8)
 
     async def run_live() -> SendStats:
-        async with open_gateway(load_gateway()) as (link, rc):
+        cfg = load_gateway()
+        async with open_gateway(cfg) as (link, rc):
             return await send_steps(
                 link, rc, device_ids, steps,
+                config=cfg,
                 confirm=not no_confirm,
                 confirm_timeout=confirm_timeout,
             )
@@ -109,8 +111,11 @@ def selftest(light: str) -> None:
     from .executor import SendAborted, SendStats, open_gateway, send_steps
 
     async def run() -> SendStats:
-        async with open_gateway(load_gateway()) as (link, rc):
-            return await send_steps(link, rc, device_ids, steps, confirm=True)
+        cfg = load_gateway()
+        async with open_gateway(cfg) as (link, rc):
+            return await send_steps(
+                link, rc, device_ids, steps, config=cfg, confirm=True
+            )
 
     try:
         stats = asyncio.run(run())
@@ -270,7 +275,11 @@ def discover() -> None:
 
 @cli.command()
 @click.argument("name")
-@click.option("--yes", is_flag=True, help="skip confirmation (save all offered)")
+@click.option(
+    "--yes",
+    is_flag=True,
+    help="save the first matching candidate without confirming",
+)
 def learn(name: str, yes: bool) -> None:
     """Guided toggle-and-observe mapping: NAME gets a device from candidates."""
 
@@ -288,15 +297,23 @@ def learn(name: str, yes: bool) -> None:
                 raise SystemExit(1)
             for dev in candidates:
                 click.echo(f"toggling device 0x{dev.address:02X} …")
+                # ON → 0.6 s dwell → OFF is wrapped in try/finally so EVERY
+                # exit — including KeyboardInterrupt (Ctrl-C), which asyncio
+                # surfaces as CancelledError that `except Exception` does NOT
+                # catch — commands the best-effort OFF and never latches the
+                # light ON. The OFF write is idempotent (latching relay), so
+                # also sending it after a normal confirmed OFF is harmless.
                 try:
                     await set_relay(link, rc, dev.address, True)
                     await asyncio.sleep(0.6)
                     await set_relay(link, rc, dev.address, False)
                 except Exception as exc:
                     # With the DEVICE_STATUS parser not yet captured (Task 9
-                    # Step 5), confirm misses raise before the OFF half; send a
-                    # best-effort OFF so the walk does not leave lights latched.
+                    # Step 5), confirm misses raise before the OFF half;
+                    # report and keep walking.
                     click.echo(f"  toggle failed: {exc}", err=True)
+                    continue
+                finally:
                     if link.local_host_address is not None:
                         try:
                             await link.write_can_frame(
@@ -304,7 +321,6 @@ def learn(name: str, yes: bool) -> None:
                             )
                         except Exception:
                             pass  # link is gone; the gateway drops the session with it
-                    continue
                 if yes or click.confirm(f"Was that {name}?"):
                     lights.save_light(lights_path(), name, dev.address)
                     click.echo(f"saved: {name} = 0x{dev.address:02X}")

@@ -69,11 +69,9 @@ def _check_name(name: str) -> None:
 
 def _write(m: LightMap, path: Path) -> None:
     # tomli_w has no unsigned-int hex form: a "0x2E41" value is emitted as a
-    # quoted string, which breaks the device_id = 0x... integer round-trip,
-    # and it renders nested per-entry dicts as flat tables instead of the
-    # required [lights.NAME] / [combos.NAME] sub-table shape. All names and
-    # members passed here are regex-validated, so the whole document is
-    # emitted as raw text with bare keys and simple quoted strings.
+    # quoted string, which breaks the device_id = 0x... integer round-trip.
+    # All names and members passed here are regex-validated, so the document
+    # is emitted as raw text with bare keys and simple quoted strings.
     lines: list[str] = []
     for k, v in sorted(m.lights.items()):
         lines.append(f"[lights.{k}]\ndevice_id = 0x{v:04X}\n")

@@ -78,9 +78,16 @@ class RemoteControlSessionError(RuntimeError):
 class RemoteControl:
     """Per-device REMOTE_CONTROL session (id 0x0004) with a 0.5 s heartbeat.
 
+    Each device gets its OWN session/heartbeat: ``ensure`` for a second device
+    must never abandon the first one's keepalive (the combo/multi-device send
+    needs both alive simultaneously). ``open``/``target`` reflect the most
+    recently established session (kept for simple state checks/back-compat);
+    per-device liveness is tracked in ``_sessions``/``_heartbeats``.
+
     Responses (message_type 0x81) are correlated through per-request futures
     resolved by ``handle_frame`` — which the caller must register on
-    ``link.on_frame`` BEFORE any request is written.
+    ``link.on_frame`` BEFORE any request is written. Only one seed/key
+    exchange may be in flight at a time (``ensure`` awaits each one).
     """
 
     def __init__(self, link: GatewayLink) -> None:
@@ -89,7 +96,8 @@ class RemoteControl:
         self.target: int | None = None
         self._seed_fut: asyncio.Future[int] | None = None
         self._key_fut: asyncio.Future[None] | None = None
-        self._heartbeat_task: asyncio.Task[None] | None = None
+        self._sessions: set[int] = set()
+        self._heartbeats: dict[int, asyncio.Task[None]] = {}
 
     # ---- frame dispatch (registered as link.on_frame) --------------------
 
@@ -114,11 +122,24 @@ class RemoteControl:
         elif msg == 0x43 and self._key_fut and not self._key_fut.done():
             self._key_fut.set_result(None)
         elif msg == 0x45:  # device closed the session (heartbeat ACK 0x44 is NOT a close)
-            self.open = False
-            self.target = None
+            device = frame.source_address
+            self._close_session_state(device)
+            if device is None or device == self.target:
+                self.open = False
+                self.target = None
+
+    def _close_session_state(self, device_id: int | None) -> None:
+        """Drop one device's session state (device-initiated 0x45 / teardown)."""
+        if device_id is None:
+            return
+        self._sessions.discard(device_id)
+        task = self._heartbeats.pop(device_id, None)
+        if task is not None and not task.done():
+            task.cancel()
 
     async def ensure(self, device_id: int) -> bool:
-        if self.open and self.target == device_id:
+        task = self._heartbeats.get(device_id)
+        if device_id in self._sessions and task is not None and not task.done():
             return True
         source = self.link.local_host_address
         if source is None:
@@ -141,6 +162,7 @@ class RemoteControl:
         try:
             seed = await asyncio.wait_for(self._seed_fut, timeout=_SEED_TIMEOUT_S)
         except TimeoutError:
+            self._seed_fut = None  # late responses must not touch an abandoned future
             raise RemoteControlSessionError(
                 f"SESSION_REQUEST_SEED timed out for device 0x{device_id:02X} "
                 "(V1 gateway requires an explicit exchange — check source/target)"
@@ -148,6 +170,7 @@ class RemoteControl:
 
         # Key transmit: REQUEST/0x43 payload [sid2, key4BE] -> RESPONSE/0x43 [sid2]
         key = tea_encrypt(RC_CYPHER, seed)
+        self._seed_fut = None
         self._key_fut = loop.create_future()
         await self.link.write_can_frame(
             compose_ids_can_extended_wire_frame(
@@ -157,20 +180,24 @@ class RemoteControl:
         try:
             await asyncio.wait_for(self._key_fut, timeout=_KEY_TIMEOUT_S)
         except TimeoutError:
+            self._key_fut = None  # late responses must not touch an abandoned future
             raise RemoteControlSessionError(
                 f"SESSION_TRANSMIT_KEY timed out for device 0x{device_id:02X}"
             ) from None
+        finally:
+            self._key_fut = None
 
         self.open = True
         self.target = device_id
-        self._heartbeat_task = asyncio.create_task(self._heartbeat(device_id))
+        self._sessions.add(device_id)
+        self._heartbeats[device_id] = asyncio.create_task(self._heartbeat(device_id))
         return True
 
     async def _heartbeat(self, device_id: int) -> None:
         source = self.link.local_host_address
-        while self.open and self.target == device_id:
+        while device_id in self._sessions:
             await asyncio.sleep(_RC_SESSION_HEARTBEAT_S)
-            if not (self.open and self.target == device_id):
+            if device_id not in self._sessions:
                 break
             try:
                 await self.link.write_can_frame(
@@ -179,40 +206,49 @@ class RemoteControl:
                     )
                 )
             except Exception:
-                return  # link down; the gateway drops the session with it
+                # link down; the gateway drops the session with it
+                self._sessions.discard(device_id)
+                return
 
     async def end(self, device_id: int | None = None) -> None:
-        """Explicitly close the session (REQUEST/0x45 payload [sid2])."""
-        target = device_id if device_id is not None else self.target
-        await self._cancel_heartbeat()
-        self.open = False
-        self.target = None
-        if target is None:
-            return
+        """Explicitly close the session (REQUEST/0x45 payload [sid2]).
+
+        ``device_id=None`` ends ALL open sessions; one id ends only that
+        device's (other devices' heartbeats stay alive).
+        """
+        targets = list(self._sessions) if device_id is None else [device_id]
+        for target in targets:
+            self._close_session_state(target)
+        if device_id is None:
+            self.open = False
+            self.target = None
+        elif self.target == device_id:
+            self.open = False
+            self.target = None
         source = self.link.local_host_address
         if source is None:
             return
-        try:
-            await self.link.write_can_frame(
-                compose_ids_can_extended_wire_frame(0x80, source, target, 0x45, _RC_SID_BYTES)
-            )
-        except Exception:
-            pass  # link down; the gateway drops the session with the connection
-
-    async def _cancel_heartbeat(self) -> None:
-        if self._heartbeat_task and not self._heartbeat_task.done():
-            self._heartbeat_task.cancel()
-        self._heartbeat_task = None
+        for target in targets:
+            try:
+                await self.link.write_can_frame(
+                    compose_ids_can_extended_wire_frame(0x80, source, target, 0x45, _RC_SID_BYTES)
+                )
+            except Exception:
+                pass  # link down; the gateway drops the session with the connection
 
     async def aclose(self) -> None:
-        """Cancel the heartbeat WITHOUT SESSION_END (the 1.0.48 relay gotcha).
+        """Cancel ALL heartbeats WITHOUT SESSION_END (the 1.0.48 relay gotcha).
 
-        Also resets session state: the gateway drops the session when the BLE
+        Also resets session state: the gateway drops the sessions when the BLE
         link closes (which is what follows ``aclose`` in every caller), so
-        leaving ``open``/``target`` set would expose a stale keepalive-less
-        session that ``ensure`` would early-return on. A later ``ensure``
-        performs a full seed/key rebuild.
+        leaving state set would expose a stale keepalive-less session that
+        ``ensure`` would early-return on. A later ``ensure`` performs a full
+        seed/key rebuild.
         """
-        await self._cancel_heartbeat()
+        for task in self._heartbeats.values():
+            if not task.done():
+                task.cancel()
+        self._heartbeats.clear()
+        self._sessions.clear()
         self.open = False
         self.target = None
