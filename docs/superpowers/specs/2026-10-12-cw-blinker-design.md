@@ -87,10 +87,14 @@ mode 600; also discoverable from HA's config-entry storage in container
 4. **Restore**: final commands return every touched light to its pre-send
    state (see Safety).
 
-Speed honesty: the relay-command round trip is measured live (during
-`selftest`/first send); if it exceeds ~60% of dit length, the CLI downscales
-WPM (with a warning: `requested 18 WPM, measured RTT allows ~9 — sending at
-9`) rather than garbling the message. Expected envelope 8–15 WPM given
+Speed honesty (amended 2026-10-12 after final review): the relay-command round
+trip is measured live during each sending run; when the commanded WPM exceeds
+the measured RTT envelope (~60% of dit length), the CLI prints a warning with
+the suggested max WPM. In v1 this warning is advisory and arrives AFTER the
+run — a first-send auto-downscale is impossible without a pre-measured RTT
+(chicken-and-egg), and no RTT state is retained between runs yet. Once the
+sniff capture (Task 9 Step 5) populates real RTT data, auto-downscale from the
+stored envelope becomes a follow-up. Expected envelope 8–15 WPM given
 BLE + status-feedback latency.
 
 ## Light mapping and what "a light" is
