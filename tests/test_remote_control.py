@@ -83,3 +83,17 @@ async def test_status_response_for_seed_raises():
     link.on_frame = rc.handle_frame
     with pytest.raises(RemoteControlSessionError, match="BUSY|0x0B"):
         await rc.ensure(0x2E)
+
+
+async def test_aclose_resets_state_and_next_ensure_rebuilds():
+    seed = 0x0BADF00D
+    link = RecordingLink([make_seed_response(seed), make_key_ack(), make_seed_response(seed), make_key_ack()])
+    rc = RemoteControl(link)  # type: ignore[arg-type]
+    link.on_frame = rc.handle_frame
+    assert await rc.ensure(0x2E) is True
+    await rc.aclose()
+    assert rc.open is False and rc.target is None
+    # second open is a full rebuild, not the early-return path
+    assert await rc.ensure(0x2E) is True
+    assert rc.open is True
+    await rc.aclose()

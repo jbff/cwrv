@@ -205,5 +205,14 @@ class RemoteControl:
         self._heartbeat_task = None
 
     async def aclose(self) -> None:
-        """Cancel the heartbeat WITHOUT SESSION_END (the 1.0.48 relay gotcha)."""
+        """Cancel the heartbeat WITHOUT SESSION_END (the 1.0.48 relay gotcha).
+
+        Also resets session state: the gateway drops the session when the BLE
+        link closes (which is what follows ``aclose`` in every caller), so
+        leaving ``open``/``target`` set would expose a stale keepalive-less
+        session that ``ensure`` would early-return on. A later ``ensure``
+        performs a full seed/key rebuild.
+        """
         await self._cancel_heartbeat()
+        self.open = False
+        self.target = None
