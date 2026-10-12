@@ -114,8 +114,11 @@ class GatewayLink:
 
     @staticmethod
     def relay_state_from_status(payload: bytes) -> bool | None:
-        """DEVICE_STATUS -> relay on/off. Derived from live data (Task 9); None until then."""
-        return None
+        """DEVICE_STATUS -> relay on/off; None when the mapping is unrecognized."""
+        # DERIVED FROM CAPTURE <date>: <describe the byte/bit mapping in one line here>
+        if not payload:
+            return None
+        return None  # ← replace with the derived mapping, or keep None if unresolvable
 
     async def write_can_frame(self, frame: bytes) -> None:
         """Write a raw IDS wire frame ([dlc][id][payload]) to CAN_WRITE."""

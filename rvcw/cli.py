@@ -1,7 +1,7 @@
 """rvcw command-line interface."""
 from __future__ import annotations
 
-import asyncio  # noqa: F401  (placeholder; see Task 11 for live send)
+import asyncio
 
 import click
 
@@ -60,6 +60,55 @@ def lights_cmd() -> None:
         click.echo(f"light {name} 0x{m.lights[name]:04X}")
     for name in sorted(m.combos):
         click.echo(f"combo {name} = {'+'.join(m.combos[name])}")
+
+
+@cli.command()
+def sniff() -> None:
+    """Stream decoded CAN frames (for deriving DEVICE_STATUS relay formats)."""
+
+    async def run() -> None:
+        cfg = load_gateway()
+        from .ble.session import RemoteControl, unlock_gateway
+        from .ble.transport import GatewayLink
+
+        link = GatewayLink(cfg.mac, cfg.pin)
+        rc = RemoteControl(link)
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        count = 0
+
+        def show(frame) -> None:
+            nonlocal count
+            count += 1
+            dst = frame.target_address
+            data = frame.message_data
+            line = (
+                f"#{count:05d} t=+{loop.time() - start:8.3f}s "
+                f"type=0x{frame.message_type:02X} src=0x{frame.source_address:02X} "
+                f"dst={'-' if dst is None else f'0x{dst:02X}'} "
+                f"data={'-' if data is None else f'0x{data:02X}'} "
+                f"dlc={frame.dlc} payload={frame.payload.hex()}"
+            )
+            if frame.message_type == 0x03:  # DEVICE_STATUS: help the derivation loop
+                line += f" relay_state={GatewayLink.relay_state_from_status(frame.payload)}"
+            click.echo(line)
+
+        # rc.handle_frame must be registered before any session request is written
+        link.on_frame = lambda frame: (rc.handle_frame(frame), show(frame))
+        await link.connect()
+        try:
+            await unlock_gateway(link)
+            click.echo(f"sniffing {cfg.mac}… Ctrl-C to stop")
+            while True:
+                await asyncio.sleep(0.5)
+        finally:
+            await rc.aclose()  # cancels the heartbeat WITHOUT SESSION_END
+            await link.close()
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        pass
 
 
 def main() -> None:

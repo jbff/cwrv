@@ -3,13 +3,19 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import time
+from typing import TYPE_CHECKING
 
-from rvcw.ble.transport import GatewayLink
+from rvcw.ble.transport import GatewayLink, LinkError
 from rvcw.protocol import (
     IdsCanWireFrame,
+    compose_ids_can_extended_wire_frame,
     compose_ids_can_standard_wire_frame,
     parse_ids_can_wire_frame,
 )
+
+if TYPE_CHECKING:
+    from rvcw.ble.session import RemoteControl
 
 PRODUCT_ID_ANDROID_APP = 46  # OneControl Android Mobile App (0x002E)
 DEVICE_TYPE_ANDROID = 22  # ANDROID_MOBILE_DEVICE
@@ -81,3 +87,60 @@ async def claim_local_host(link: GatewayLink, observed: set[int]) -> int:
         await link.write_can_frame(frame)
         await asyncio.sleep(0.04)
     return claimed
+
+
+def relay_command(source: int, target: int, on: bool) -> bytes:
+    """RelayBasicLatching Type2 COMMAND: 0x01=on / 0x00=off in message_data."""
+    return compose_ids_can_extended_wire_frame(
+        0x82, source, target, 0x01 if on else 0x00, b""
+    )
+
+
+class RelayConfirmError(RuntimeError):
+    def __init__(self, device_id: int, on: bool) -> None:
+        self.device_id = device_id
+        self.on = on
+        super().__init__(
+            f"relay 0x{device_id:02X} did not confirm {'ON' if on else 'OFF'}"
+        )
+
+
+_CONFIRM_POLL_INTERVAL_S = 0.05
+
+
+async def confirm_relay(link: GatewayLink, device_id: int, on: bool, timeout: float) -> bool:
+    """Poll DEVICE_STATUS-derived relay state until the deadline."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = link.relay_states.get(device_id)
+        if state is on:
+            return True
+        await asyncio.sleep(_CONFIRM_POLL_INTERVAL_S)
+    return link.relay_states.get(device_id) is on
+
+
+async def set_relay(
+    link: GatewayLink,
+    rc: RemoteControl,
+    device_id: int,
+    on: bool,
+    confirm_timeout: float = 2.0,
+) -> None:
+    """Ensure a session, send the relay COMMAND, and confirm the state change.
+
+    On a missed confirmation, one idempotent rewrite is sent (a latching relay
+    command is safe to repeat) followed by one more confirmation window;
+    a second miss raises :class:`RelayConfirmError`.
+    """
+    from rvcw.ble.session import RemoteControlSessionError
+
+    if link.local_host_address is None:
+        raise LinkError("LocalHost address not claimed")
+    if not await rc.ensure(device_id):
+        raise RemoteControlSessionError(f"session failed for device 0x{device_id:02X}")
+    await link.write_can_frame(relay_command(link.local_host_address, device_id, on))
+    if not await confirm_relay(link, device_id, on, timeout=confirm_timeout):
+        # one rewrite (idempotent for a latching relay), then fail
+        await link.write_can_frame(relay_command(link.local_host_address, device_id, on))
+        if not await confirm_relay(link, device_id, on, timeout=confirm_timeout):
+            raise RelayConfirmError(device_id, on)
