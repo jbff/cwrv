@@ -35,25 +35,32 @@ Python package `rvcw` (asyncio, `uv`-managed, Python 3.12+).
 rvcw/
 ├─ cli.py          # click CLI — the only user-facing surface
 ├─ morse.py        # pure Morse engine: text → timed on/off schedule. No I/O.
-├─ lights.py       # named lights/combos → CAN switch addresses; TOML load/save
-├─ discovery.py    # enumerate switches; guided toggle-and-observe name mapping
+├─ lights.py       # named lights/combos → CAN device addresses; TOML load/save
+├─ executor.py     # walks the schedule against the live gateway (pacing, retries,
+│                  # off-guarantee, WPM honesty)
+├─ discovery.py    # enumerate devices; guided toggle-and-observe name mapping; sniff
 └─ ble/
-   ├─ transport.py # Bleak client over BlueZ D-Bus; CAN_WRITE write / DATA_READ notify
-   ├─ can.py       # V1/V2 frame codec, CAN password unlock, source claiming
-                   # (adapted from ids_can_wire.py)
-   └─ session.py   # step-1 UNLOCK_STATUS→KEY, step-2 SEED→KEY (16-byte) TEA
-                   # handshake, session state (ported from coordinator.py)
+   ├─ transport.py # GatewayLink: Bleak client, MTU 185, CAN_WRITE write / CAN_READ
+   │               # notify; V2 notification decoding (Packed/ElevenBit/TwentyNineBit)
+   ├─ can.py       # LocalHost address claim + identity advertisement; relay COMMAND
+   │               # 0x82 frame composition; DEVICE_STATUS relay-state parsing
+   └─ session.py   # unlock (key/seed via UNLOCK_STATUS/KEY, GATT PASSWORD_UNLOCK PIN)
+                   # + per-device REMOTE_CONTROL session (preflight, 0x42/0x43
+                   # seed/key, 0.5 s heartbeat, close)
 plus vendored protocol/ from ha-onecontrol: commands.py, events.py, cobs.py,
-crc8.py, tea.py — imported as-is where practical, with MIT attribution
-(NOTICE file), lightly normalized for import outside HA.
+crc8.py, tea.py, ids_can_wire.py, function_names.py, const.py — imported
+as-is (except import fixes), under NOTICE/retained headers (MIT).
 ```
 
 Boundary rule: `morse.py`/`lights.py` are hardware-free and BLE-free; `ble/`
 knows nothing about Morse. The CLI composes them.
 
-Known doc gap: `commands.py` references "INTERNALS.md § Command Building" —
-check whether INTERNALS.md exists upstream; if not, reconstruct frame-building
-notes from the code into `docs/protocol-notes.md` during implementation.
+- `docs/superpowers/specs/` — this spec (plus plans under `plans/`).
+
+Config files (never committed): `~/.config/rvcw/config.toml` —
+`[gateway] mac = "10:06:1C:E7:B8:3E"`, `pin = "<6-digit>"` (PIN stored
+mode 600; also discoverable from HA's config-entry storage in container
+`has`), default WPM.
 
 ## Send flow
 
@@ -62,28 +69,44 @@ notes from the code into `docs/protocol-notes.md` during implementation.
 1. **Morse engine** (`morse.py`): ITU standard timing — dit = 1 unit,
    dah = 3, intra-character gap = 1, inter-character gap = 3, word gap = 7;
    unit = 1200/WPM ms. Output: an on/off schedule against the mapped light.
-   Also supports prosigns (`AR`, `SK`, `BT`) and repeats (`--repeat`).
-2. **Session** (`session.py`): reuse the authenticated gateway session or
-   open one (multiplexed per Phase-1 findings).
-3. **Executor**: walk the schedule ack-paced — each on/off step is a
-   `CMD_ACTION_SWITCH` (0x40 frame) write awaited against the `0x02` ack
-   event; the next element starts on ack, keeping timing honest against BLE
-   latency. Combos expand to concurrent per-members schedules, each
-   ack-paced.
+   Also supports prosigns in `<AR>`/`<SK>`/`<BT>` form and repeats (`--repeat`).
+2. **Session**: reuse or open the gateway path — key/seed GATT unlock
+   (UNLOCK_STATUS → TEA `CAN_BLE_KEY_SEED_CIPHER` → KEY), PASSWORD_UNLOCK
+   PIN if the gate reports locked, LocalHost address claim, then a
+   per-device REMOTE_CONTROL session with 0.5 s heartbeat (open once per
+   sending run, per Phase-1 findings on coexistence).
+3. **Executor**: walk the schedule **clock-scheduled with confirmation
+   supervision**. Each step is written at its scheduled wall-clock time
+   (relay COMMAND 0x82 frame, `message_data` 0x01/0x00, empty payload,
+   raw `[dlc][id4][payload]` to CAN_WRITE); the DEVICE_STATUS feedback
+   stream then confirms the relay reached the commanded state within the
+   element's window. Source had no dedicated ack event — 0x02 frames are
+   metadata responses — so state-confirmation, not ack-events, is the
+   pacing verifier. A missed confirmation retries ONCE within the element;
+   two consecutive misses abort with the off-guarantee.
 4. **Restore**: final commands return every touched light to its pre-send
    state (see Safety).
 
-Speed honesty: live ack round-trip is measured; if RTT exceeds ~60% of dit
-length, the CLI downscales WPM (warningly) instead of garbling the message.
-Expected envelope 8–15 WPM per the briefing's 50–150 ms element granularity.
+Speed honesty: the relay-command round trip is measured live (during
+`selftest`/first send); if it exceeds ~60% of dit length, the CLI downscales
+WPM (with a warning: `requested 18 WPM, measured RTT allows ~9 — sending at
+9`) rather than garbling the message. Expected envelope 8–15 WPM given
+BLE + status-feedback latency.
 
-## Light mapping
+## Light mapping and what "a light" is
+
+On the IDS-CAN path, relays/latched panel switches are commanded by
+**device address** (the device's bus source address; `table_id` is dropped):
+0x82 COMMAND frame, `target_address=device_id`, `message_data` 0x01=on /
+0x00=off, empty payload. Dimmable/RGB light entities have no
+CAN-BLE direct path in the source (they go via the legacy COBS data
+service, out of scope for v1) — v1 blinks on/off-capable relay targets.
 
 TOML at `~/.config/rvcw/lights.toml`:
 
 ```toml
 [lights.awning]
-address = "switch:0x2E41"        # addressing per prior-art func_id/counter notes
+device_id = 0x2E41              # IDS-CAN bus source address of the relay device
 
 [combos.night_mode]
 members = ["awning", "spots"]
@@ -99,19 +122,45 @@ fast naming the file and key.
 
 Both HA's coordinator (in container `has`) and `rvcw` are Bleak clients over
 the same host BlueZ; BlueZ dedupes them onto one GATT connection. The BLE
-link is therefore not the risk — the IDS-CAN session (seed/key TEA auth,
-LocalHost source claiming, REMOTE_CONTROL handling) may be single-owner.
+link is therefore not the risk — two independent IDS-CAN participant
+identities are: each client claims its own LocalHost address (distinct,
+chosen from unobserved addresses) and opens its own per-device
+REMOTE_CONTROL session. Source facts: REMOTE_CONTROL session ID is 4
+(0x0004) and is per-device, kept alive by 0.5 s heartbeats; sessions stay
+owned until explicitly closed (0x45) or the BLE link drops — **but closing
+a session right after relay commands was tried upstream (1.0.48) and
+reverted (devices rejected later commands, reason 0x0E)**, so rvcw leaves
+its session open across sends and closes it only on explicit
+`rvcw session --end` or link teardown.
 
 **Phase 1 — session probe (first implementation milestone):**
-`rvcw probe-session` opens an authenticated second session while HA stays
-connected and reports the outcome. Outcomes feed phase 2:
+`rvcw probe-session` connects alongside HA, unlocks, claims its LocalHost,
+opens a REMOTE_CONTROL session with one relay device while HA is connected,
+reports the outcome, and leaves the bus as it found it. Outcomes feed
+phase 2:
 
-- Second session works → straightforward multiplexed sending.
+- Second participant works → straightforward multiplexed sending.
 - Gateway refuses → document the failure mode, then design the fallback
   (coordinate with HA's coordinator to pause, e.g. disable the integration
   entry programmatically) **before** continuing; never silently contend.
 
 `rvcw send` fails fast with a clear message if it cannot obtain a session.
+
+## Reality notes (from source extracts, 2026-10-12)
+
+- No dedicated ack event exists; `0x02` frames are metadata responses
+  correlated by 16-bit command id. Pacing relies on DEVICE_STATUS feedback.
+- No `INTERNALS.md` is shipped (referenced by docstrings only); rvcw keeps
+  its own `docs/protocol-notes.md` from the extracts.
+- Key derivation is pure 32-round TEA (no hashing) over a 4-byte seed;
+  CRC-8 uses the integration's custom table (init 0x55, poly 0x07).
+- Our gateway is the 24955 ("V1"-behaving) variant — it requires the
+  explicit REMOTE_CONTROL seed/key exchange even though the version char
+  says V1.
+- DEVICE_STATUS/relay-state payload parsing on the CAN-BLE path is not
+  fully documented in the source; it is derived from live captures
+  (`rvcw sniff` toggling while HA flips a switch) in the plan, with a
+  time-only pacing fallback if status parsing proves unreliable.
 
 ## Safety
 
