@@ -1,4 +1,5 @@
 # tests/test_executor.py
+import asyncio
 import time
 
 import pytest
@@ -12,7 +13,7 @@ from rvcw.morse import Step
 class TimelineLink:
     """Records write times by parsing the actual relay command frames."""
 
-    def __init__(self, confirm_on_write_no: int = 0):
+    def __init__(self, confirm_on_write_no: int = 0, confirm_delay_s: float = 0.0):
         self.local_host_address = 0x2D
         self.relay_states: dict[int, bool] = {}
         self.writes: list[tuple[float, int, bool]] = []  # (t_s, target, on)
@@ -21,6 +22,9 @@ class TimelineLink:
         # Confirm simulation: mark relay_states once this device has received
         # this many TYPE-2 relay writes (0 = never confirms; 1 = immediate).
         self.confirm_on_write_no = confirm_on_write_no
+        # DEVICE_STATUS latency: the confirmation lands this many seconds
+        # AFTER the write (loop.call_later, like the real notification path).
+        self.confirm_delay_s = confirm_delay_s
         self._device_writes: dict[int, int] = {}
 
     async def write_can_frame(self, frame: bytes) -> None:
@@ -34,7 +38,17 @@ class TimelineLink:
             count = self._device_writes.get(wire.target_address, 0) + 1
             self._device_writes[wire.target_address] = count
             if self.confirm_on_write_no and count >= self.confirm_on_write_no:
-                self.relay_states[wire.target_address] = wire.message_data == 0x01
+                self._confirm_later(wire.target_address, wire.message_data == 0x01)
+
+    def _confirm_later(self, device_id: int, on: bool) -> None:
+        if self.confirm_delay_s <= 0.0:
+            self.relay_states[device_id] = on
+        else:
+            loop = asyncio.get_running_loop()
+            loop.call_later(self.confirm_delay_s, self._mark_state, device_id, on)
+
+    def _mark_state(self, device_id: int, on: bool) -> None:
+        self.relay_states[device_id] = on
 
     def mark(self, device_id: int, on: bool) -> None:
         self.relay_states[device_id] = on
@@ -146,6 +160,23 @@ async def test_restore_failure_is_counted_not_raised():
         link, FakeRC(), [0x2E], [Step(True, 100), Step(False, 100)], confirm=False
     )
     assert stats.restore_failures == 1
+
+
+async def test_confirm_latency_does_not_drift_next_write_boundary():
+    """Confirm arrive-late must not stretch the next element's write time.
+
+    Elements on/off at 0/150 ms with 100 ms confirm latency on the FIRST
+    element: the second write must still land ≈150 ms (the old bug slept a
+    delay computed BEFORE the confirm gather, pushing the second write to
+    ≈250 ms).
+    """
+    link = TimelineLink(confirm_on_write_no=1, confirm_delay_s=0.10)
+    rc = FakeRC()  # type: ignore[arg-type]
+    await send_steps(
+        link, rc, [0x2E], [Step(True, 150), Step(False, 150)], confirm=True, confirm_timeout=0.5
+    )  # type: ignore[arg-type]
+    # PINNING-ASSERT (second write lands on its scheduled boundary):
+    assert 0.145 <= link.writes[1][0] < 0.17, link.writes
 
 
 async def test_empty_device_ids_rejected():

@@ -66,6 +66,7 @@ def send(text: str, light: str, wpm: int | None, repeat: int, dry_run: bool, no_
             click.echo(f"{'ON ' if s.on else 'off'}{s.ms:6d}ms")
         return
 
+    from .ble.transport import LinkError
     from .executor import SendAborted, SendStats, open_gateway, send_steps
 
     confirm_timeout = max(0.05, (1200 / wpm) / 1000 * 0.8)
@@ -81,7 +82,7 @@ def send(text: str, light: str, wpm: int | None, repeat: int, dry_run: bool, no_
     try:
         click.echo("connecting…")
         stats = asyncio.run(run_live())
-    except (SendAborted, RemoteControlSessionError) as exc:
+    except (SendAborted, RemoteControlSessionError, LinkError) as exc:
         click.echo(f"aborted: {exc}", err=True)
         raise SystemExit(1) from None
     if stats.rtt_ms is not None and stats.rtt_ms > 0:

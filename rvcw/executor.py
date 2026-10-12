@@ -97,7 +97,6 @@ async def send_steps(
                 for d in device_ids
             ))
             pos += step.ms  # AFTER the write: the first write is never delayed
-            delay = start + pos / 1000.0 - time.monotonic()
             if confirm:
                 confirmed = await asyncio.gather(*(
                     confirm_one(d, step.on) for d in device_ids
@@ -116,6 +115,10 @@ async def send_steps(
                     consecutive_misses += 1
                     if consecutive_misses >= 2:
                         raise SendAborted("two consecutive steps unconfirmed; aborting")
+            # Recompute AFTER any confirm work: a confirm window that consumed
+            # part of the element must not stretch the next write past its
+            # scheduled boundary; the clock stays absolute (start + pos).
+            delay = start + pos / 1000.0 - time.monotonic()
             if delay > 0:
                 await asyncio.sleep(delay)
     finally:
