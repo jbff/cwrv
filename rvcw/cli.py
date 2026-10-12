@@ -16,12 +16,22 @@ def cli() -> None:
     """Blink CW (Morse) messages on RV panel lights."""
 
 
-def _resolve(
-    text: str, light: str, wpm: int, repeat: int, dry_run: bool
-) -> tuple[list[morse.Step], list[int]]:
+def _resolve(text: str, light: str, wpm: int, repeat: int) -> tuple[
+    list[morse.Step], list[int]
+]:
     steps = morse.schedule(text, wpm=wpm, repeat=repeat)
     entries = lights.load_map(lights_path()).resolve(light)
     return steps, [e.device_id for e in entries]
+
+
+def _parse_device_id(_ctx, _param, value: str) -> int:
+    """Accept decimal and 0x-prefixed hex device ids (plain `int` rejects hex)."""
+    try:
+        return int(value, 0)
+    except ValueError:
+        raise click.BadParameter(
+            f"device id must be an integer like 0x2E41, got {value!r}"
+        ) from None
 
 
 @cli.command()
@@ -30,12 +40,17 @@ def _resolve(
 @click.option("--wpm", default=None, type=int, help="default from config.toml")
 @click.option("--repeat", default=1, type=int)
 @click.option("--dry-run", is_flag=True)
-def send(text: str, light: str, wpm: int | None, repeat: int, dry_run: bool) -> None:
+@click.option(
+    "--no-confirm",
+    is_flag=True,
+    help="skip DEVICE_STATUS waiting (if status parsing failed)",
+)
+def send(text: str, light: str, wpm: int | None, repeat: int, dry_run: bool, no_confirm: bool) -> None:
     """Blink TEXT as CW on the requested light."""
     if wpm is None:
         wpm = load_gateway().wpm
     try:
-        steps, device_ids = _resolve(text, light, wpm, repeat, dry_run)
+        steps, device_ids = _resolve(text, light, wpm, repeat)
     except (KeyError, ValueError) as exc:
         # Fail fast with a visible message (unknown light = KeyError; bad
         # character/wpm/repeat = ValueError). KeyError's str() reprs its arg,
@@ -50,7 +65,87 @@ def send(text: str, light: str, wpm: int | None, repeat: int, dry_run: bool) -> 
         for s in steps:
             click.echo(f"{'ON ' if s.on else 'off'}{s.ms:6d}ms")
         return
-    raise click.ClickException("live send arrives in Task 11")
+
+    from .executor import SendAborted, SendStats, open_gateway, send_steps
+
+    confirm_timeout = max(0.05, (1200 / wpm) / 1000 * 0.8)
+
+    async def run_live() -> SendStats:
+        async with open_gateway(load_gateway()) as (link, rc):
+            return await send_steps(
+                link, rc, device_ids, steps,
+                confirm=not no_confirm,
+                confirm_timeout=confirm_timeout,
+            )
+
+    try:
+        click.echo("connecting…")
+        stats = asyncio.run(run_live())
+    except (SendAborted, RemoteControlSessionError) as exc:
+        click.echo(f"aborted: {exc}", err=True)
+        raise SystemExit(1) from None
+    if stats.rtt_ms is not None and stats.rtt_ms > 0:
+        max_wpm = int(1200 / max(stats.rtt_ms / 0.60, 1.0))
+        if wpm > max_wpm:
+            click.echo(
+                f"warning: requested {wpm} WPM, measured RTT {stats.rtt_ms:.0f}ms "
+                f"suggests ~{max_wpm} WPM max — reduce --wpm for crisp morse"
+            )
+    click.echo("sent")
+
+
+@cli.command()
+@click.option("--light", required=True, help="light or combo name from lights.toml")
+def selftest(light: str) -> None:
+    """Blink 'R' at 5 WPM; verify off-restore and report confirm misses."""
+    try:
+        steps, device_ids = _resolve("R", light, 5, 1)
+    except (KeyError, ValueError) as exc:
+        msg = str(exc.args[0]) if exc.args else str(exc)
+        raise click.ClickException(msg) from None
+
+    from .executor import SendAborted, SendStats, open_gateway, send_steps
+
+    async def run() -> SendStats:
+        async with open_gateway(load_gateway()) as (link, rc):
+            return await send_steps(link, rc, device_ids, steps, confirm=True)
+
+    try:
+        stats = asyncio.run(run())
+    except (SendAborted, RemoteControlSessionError) as exc:
+        click.echo(f"selftest FAILED: {exc}", err=True)
+        raise SystemExit(1) from None
+    click.echo(f"selftest OK: misses={stats.misses} rtt_ms={stats.rtt_ms}")
+    click.echo("check the physical light returned to its prior state now")
+
+
+@cli.command("session")
+@click.option(
+    "--end", "end_session", is_flag=True, help="END the REMOTE_CONTROL session"
+)
+@click.option(
+    "--device",
+    required=True,
+    callback=_parse_device_id,
+    help="target relay device id (e.g. 0x2E41)",
+)
+def session_cmd(end_session: bool, device: int) -> None:
+    """Explicitly END the REMOTE_CONTROL session with --device (rarely needed)."""
+    if not end_session:
+        raise click.ClickException("nothing to do — use session --end --device …")
+
+    from .executor import open_gateway
+
+    async def run() -> None:
+        async with open_gateway(load_gateway()) as (link, rc):
+            await rc.ensure(device)
+            await rc.end(device)
+        click.echo(f"session ended with 0x{device:02X} (local controls regain the device)")
+
+    try:
+        asyncio.run(run())
+    except RemoteControlSessionError as exc:
+        raise click.ClickException(str(exc)) from None
 
 
 @cli.command("lights")
@@ -110,16 +205,6 @@ def sniff() -> None:
         asyncio.run(run())
     except KeyboardInterrupt:
         pass
-
-
-def _parse_device_id(_ctx, _param, value: str) -> int:
-    """Accept decimal and 0x-prefixed hex device ids (plain `int` rejects hex)."""
-    try:
-        return int(value, 0)
-    except ValueError:
-        raise click.BadParameter(
-            f"device id must be an integer like 0x2E41, got {value!r}"
-        ) from None
 
 
 @cli.command("probe-session")
