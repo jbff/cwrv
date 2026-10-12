@@ -1,0 +1,838 @@
+"""Event parsers for decoded COBS frames from OneControl gateways.
+
+Each decoded frame has the event-type byte at index 0.
+These helpers return typed dataclass instances or ``None`` on parse failure.
+
+Reference: INTERNALS.md § Event Types, Event Parsing Examples
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Any
+
+_LOGGER = logging.getLogger(__name__)
+
+from .const import (
+    EVENT_DEVICE_COMMAND,
+    EVENT_DEVICE_LOCK_STATUS,
+    EVENT_DEVICE_ONLINE_STATUS,
+    EVENT_DIMMABLE_LIGHT,
+    EVENT_GATEWAY_INFORMATION,
+    EVENT_GENERATOR_GENIE,
+    EVENT_HBRIDGE_1,
+    EVENT_HBRIDGE_2,
+    EVENT_HOUR_METER,
+    EVENT_HVAC_STATUS,
+    EVENT_LEVELER,
+    EVENT_REAL_TIME_CLOCK,
+    EVENT_RELAY_BASIC_LATCHING_1,
+    EVENT_RELAY_BASIC_LATCHING_2,
+    EVENT_RGB_LIGHT,
+    EVENT_RV_STATUS,
+    EVENT_SESSION_STATUS,
+    EVENT_TANK_ALERT,
+    EVENT_TANK_SENSOR,
+    EVENT_TANK_SENSOR_V2,
+    METADATA_PAYLOAD_SIZE_FULL,
+    METADATA_PROTOCOL_HOST,
+    METADATA_PROTOCOL_IDS_CAN,
+)
+
+
+# ── Dataclasses ───────────────────────────────────────────────────────────
+
+
+@dataclass
+class GatewayInformation:
+    protocol_version: int = 0
+    options: int = 0
+    device_count: int = 0
+    table_id: int = 0
+    device_table_crc: int = 0           # uint32 BE at offset 5–8 (MyRvLinkGatewayInformation.cs)
+    device_metadata_table_crc: int = 0  # uint32 BE at offset 9–12; used for cache validation
+
+
+@dataclass
+class RvStatus:
+    """System voltage and temperature (event 0x07).
+
+    Format: [0x07][voltH][voltL][tempH][tempL][flags][acVoltH][acVoltL]
+    DC voltage and temperature are required (8.8 fixed-point big-endian).
+    AC voltage is optional (extended frame, 8.8 fixed-point big-endian).
+    """
+
+    voltage: float | None = None  # DC Volts (8.8 fixed-point BE)
+    temperature: float | None = None  # °F (8.8 fixed-point BE, signed)
+    feature_flags: int = 0  # data[5]
+    ac_voltage: float | None = None  # AC Volts if extended frame (8.8 fixed-point BE)
+
+
+@dataclass
+class RelayStatus:
+    """Relay Basic/Latching status (event 0x05/0x06).
+
+    INTERNALS.md § Relay Status:
+      Standard 5-byte: [evt][tbl][dev][status][res]
+      Extended 9-byte: bytes 5-6 = DTC code (BE)
+    """
+
+    table_id: int = 0
+    device_id: int = 0
+    is_on: bool = False
+    status_byte: int = 0
+    dtc_code: int = 0  # 0 = no fault
+
+
+@dataclass
+class DeviceOnline:
+    table_id: int = 0
+    device_id: int = 0
+    is_online: bool = False
+
+
+@dataclass
+class SystemLockout:
+    """System-wide in-motion lockout level from DeviceLockStatus (0x04).
+
+    Preferred bitfield format (>=8 bytes):
+      [0x04][lockoutLevel][...][tableId][deviceCount][bitfield...]
+    lockout_level > 0 means the RV is in motion and devices are locked.
+    """
+
+    lockout_level: int = 0
+    table_id: int = 0
+    device_count: int = 0
+    per_device_locked: dict[int, bool] | None = None  # device_id → locked
+
+
+@dataclass
+class DeviceLock:
+    """Device lock status (event 0x04) — legacy format."""
+
+    table_id: int = 0
+    device_id: int = 0
+    is_locked: bool = False
+
+
+@dataclass
+class TankLevel:
+    table_id: int = 0
+    device_id: int = 0
+    level: int = 0  # 0-100 %
+
+
+@dataclass
+class TankAlert:
+    """Tank alert status (level or connectivity events).
+
+    Generated when tank level crosses alert threshold or tank connectivity lost.
+    """
+
+    table_id: int = 0
+    device_id: int = 0
+    alert_type: int = 0  # 0=connectivity, 1=low_level, 2=high_level
+    is_triggered: bool = False  # True if alert is active
+
+
+@dataclass
+class LevelerStatus:
+    """Leveler/jack system status (event 0x10).
+
+    Leveling systems report their current position/state.
+    Status byte format depends on leveler type (automatic, multi-leg, air-bag, etc.).
+    """
+
+    table_id: int = 0
+    device_id: int = 0
+    is_active: bool = False  # True when leveler is operating
+    position_code: int = 0  # Leveler position (0=retracted, 1=extended, 2=mid, etc.)
+    level_achieved: bool = False  # True when desired level achieved
+
+
+@dataclass
+class DimmableLight:
+    """Dimmable light status (event 0x08).
+
+    INTERNALS.md § Dimmable Light:
+      11-byte: brightness at data[6] (statusBytes[3])
+      5-byte legacy: brightness at data[4]
+    """
+
+    table_id: int = 0
+    device_id: int = 0
+    brightness: int = 0
+    mode: int = 0  # 0=Off,1=On,2=Blink,3=Swell
+
+    @property
+    def is_on(self) -> bool:
+        return self.mode > 0
+
+
+@dataclass
+class RgbLight:
+    """RGB light status (event 0x09)."""
+
+    table_id: int = 0
+    device_id: int = 0
+    mode: int = 0  # 0=Off,1=Solid,2=Blink,4-8=Transitions,127=Restore
+    red: int = 0
+    green: int = 0
+    blue: int = 0
+    brightness: int = 255
+
+    @property
+    def is_on(self) -> bool:
+        return self.mode > 0
+
+
+@dataclass
+class HvacZone:
+    """HVAC zone status (event 0x0B).
+
+    INTERNALS.md § HVAC Command:
+      bits 0-2 = heat_mode, bits 4-5 = heat_source, bits 6-7 = fan_mode
+    """
+
+    table_id: int = 0
+    device_id: int = 0
+    heat_mode: int = 0  # 0=Off,1=Heat,2=Cool,3=Both,4=Schedule
+    heat_source: int = 0  # 0=Gas,1=HeatPump
+    fan_mode: int = 0  # 0=Auto,1=High,2=Low
+    low_trip_f: int = 0  # Heating setpoint °F
+    high_trip_f: int = 0  # Cooling setpoint °F
+    zone_status: int = 0
+    indoor_temp_f: float | None = None
+    outdoor_temp_f: float | None = None
+    dtc_code: int = 0
+
+
+@dataclass
+class CoverStatus:
+    """H-Bridge / cover status (event 0x0D/0x0E).
+
+        INTERNALS.md § Cover/Slide/Awning:
+            STATE-ONLY.  No commands (safety: no limit switches, 19-39A motors).
+            Legacy host events use 0xC0=stopped, 0xC2=opening, 0xC3=closing.
+            IDS-CAN DEVICE_STATUS commonly reports 0x00 for stopped/idle.
+    """
+
+    table_id: int = 0
+    device_id: int = 0
+    status: int = 0
+    position: int | None = None  # 0-100 or None if 0xFF
+
+    @property
+    def ha_state(self) -> str:
+        """Motor state string.
+
+        Returns the motor/controller state, NOT the cover position:
+          - ``"opening"``  — motor is extending
+          - ``"closing"``  — motor is retracting
+          - ``"stopped"``  — motor is idle (0x00 IDS-CAN, 0xC0 legacy host)
+
+        HA cover open/closed state is derived from ``position`` (when available),
+        not from this property.  See ``is_closed`` in ``cover.py``.
+        """
+        return {0xC2: "opening", 0xC3: "closing"}.get(self.status, "stopped")
+
+
+@dataclass
+class RealTimeClock:
+    """Gateway real-time clock (event 0x20)."""
+
+    year: int = 0
+    month: int = 0
+    day: int = 0
+    hour: int = 0
+    minute: int = 0
+    second: int = 0
+    weekday: int = 0
+
+
+@dataclass
+class HourMeter:
+    """Generator / device hour meter (event 0x0F)."""
+
+    table_id: int = 0
+    device_id: int = 0
+    hours: float = 0.0
+    maintenance_due: bool = False
+    maintenance_past_due: bool = False
+    error: bool = False
+
+
+@dataclass
+class GeneratorStatus:
+    """Generator Genie status (event 0x0A).
+
+    Android reference: handleGeneratorGenieStatus()
+    Frame: [0x0A][tableId][deviceId][status0][battH][battL][tempH][tempL]
+      state (bits 0-2 of status0): 0=Off,1=Priming,2=Starting,3=Running,4=Stopping
+      quiet_hours (bit 7 of status0): True when quiet hours mode active
+      battery_voltage: unsigned 8.8 fixed-point big-endian, volts
+      temperature_c: signed 8.8 fixed-point big-endian, °C; None if unsupported/invalid
+    """
+
+    table_id: int = 0
+    device_id: int = 0
+    state: int = 0  # 0=Off,1=Priming,2=Starting,3=Running,4=Stopping
+    battery_voltage: float = 0.0
+    temperature_c: float | None = None
+    quiet_hours: bool = False
+
+    @property
+    def is_running(self) -> bool:
+        """True only when fully running (state == 3)."""
+        return self.state == 3
+
+    @property
+    def state_name(self) -> str:
+        """Human-readable state string."""
+        return {0: "off", 1: "priming", 2: "starting", 3: "running", 4: "stopping"}.get(
+            self.state, "unknown"
+        )
+
+
+@dataclass
+class DeviceMetadata:
+    """Parsed metadata from GetDevicesMetadata (event 0x02) response.
+
+    INTERNALS.md § Device Metadata Retrieval:
+      function_name is BIG-ENDIAN (contrary to rest of protocol)
+      Protocol 1 (Host) with payloadSize=17 uses same fields as Protocol 2 (IdsCan)
+    """
+
+    table_id: int = 0
+    device_id: int = 0
+    function_name: int = 0
+    function_instance: int = 0
+
+
+# ── Parsers ───────────────────────────────────────────────────────────────
+
+
+def parse_gateway_information(data: bytes) -> GatewayInformation | None:
+    # Official app MinPayloadLength = 13 (MyRvLinkGatewayInformation.cs)
+    if len(data) < 13:
+        return None
+    # CRC values are big-endian per ArrayExtension.cs GetValueUInt32 (Endian.Big default)
+    return GatewayInformation(
+        protocol_version=data[1],
+        options=data[2],
+        device_count=data[3],
+        table_id=data[4],
+        device_table_crc=int.from_bytes(data[5:9], "big"),
+        device_metadata_table_crc=int.from_bytes(data[9:13], "big"),
+    )
+
+
+def parse_rv_status(data: bytes) -> RvStatus | None:
+    """Parse RvStatus (0x07).
+
+    Standard format (6 bytes): [0x07][voltH][voltL][tempH][tempL][flags]
+    Extended format (8+ bytes): ... + [acVoltH][acVoltL]
+    Both voltage and temperature are unsigned 8.8 fixed-point big-endian.
+    AC voltage is optional (extended frame, 8.8 fixed-point big-endian).
+    """
+    if len(data) < 6:
+        return None
+
+    v_raw = (data[1] << 8) | data[2]
+    t_raw = (data[3] << 8) | data[4]
+
+    voltage = None if v_raw == 0xFFFF else v_raw / 256.0
+    ac_voltage = None
+    if len(data) >= 8:
+        ac_raw = (data[6] << 8) | data[7]
+        ac_voltage = None if ac_raw == 0xFFFF else ac_raw / 256.0
+    
+    if t_raw in (0xFFFF, 0x7FFF):
+        temperature = None
+    else:
+        temperature = t_raw / 256.0
+
+    return RvStatus(voltage=voltage, temperature=temperature, feature_flags=data[5], ac_voltage=ac_voltage)
+
+
+def parse_relay_status(data: bytes) -> RelayStatus | None:
+    """Parse relay status (0x05/0x06).
+
+    INTERNALS.md § Relay Status:
+      Compact 4-byte, standard 5-byte, extended 9-byte with DTC at bytes 5-6 (BE).
+      Status low nibble: 0x01=ON, 0x00=OFF.
+    """
+    if len(data) < 4:
+        return None
+    status_byte = data[3] & 0xFF
+    is_on = (status_byte & 0x0F) == 0x01
+    dtc = 0
+    if len(data) >= 9:
+        dtc = (data[5] << 8) | data[6]
+    return RelayStatus(
+        table_id=data[1],
+        device_id=data[2],
+        is_on=is_on,
+        status_byte=status_byte,
+        dtc_code=dtc,
+    )
+
+
+def parse_device_online(data: bytes) -> DeviceOnline | None:
+    """Parse DeviceOnlineStatus (0x03).  data[3] != 0 → online."""
+    if len(data) < 4:
+        return None
+    return DeviceOnline(
+        table_id=data[1],
+        device_id=data[2],
+        is_online=data[3] != 0xFF,  # 0xFF = offline per Android source
+    )
+
+
+def parse_device_lock(data: bytes) -> SystemLockout | DeviceLock | None:
+    """Parse DeviceLockStatus (0x04).
+
+    Two formats (from Android handleDeviceLockStatus):
+      Bitfield (>=8 bytes): [0x04][lockoutLevel][??][??][??][??][tableId][deviceCount][bitfield...]
+      Legacy   (<8 bytes): [0x04][tableId][deviceId][status]
+    """
+    if len(data) < 4:
+        return None
+
+    # Bitfield format — system-wide lockout
+    if len(data) >= 8:
+        lockout_level = data[1] & 0xFF
+        table_id = data[6] & 0xFF
+        device_count = data[7] & 0xFF
+        lock_byte_count = (device_count + 7) // 8
+        per_device: dict[int, bool] | None = None
+        if len(data) >= 8 + lock_byte_count:
+            per_device = {}
+            for idx in range(device_count):
+                status_byte = data[8 + (idx // 8)] & 0xFF
+                bit_mask = 1 << (idx % 8)
+                per_device[idx] = (status_byte & bit_mask) != 0
+        return SystemLockout(
+            lockout_level=lockout_level,
+            table_id=table_id,
+            device_count=device_count,
+            per_device_locked=per_device,
+        )
+
+    # Legacy format — single device
+    return DeviceLock(
+        table_id=data[1],
+        device_id=data[2],
+        is_locked=data[3] != 0,
+    )
+
+
+def parse_tank_status(data: bytes) -> list[TankLevel]:
+    """Parse TankSensorStatus (0x0C) — multi-tank batched format.
+
+    Format: [0x0C][tableId][deviceId1][level1][deviceId2][level2]...
+    Each tank = 2 bytes. Number of tanks = (len - 2) / 2.
+
+    Each level byte is already a fill percentage (0-100), not a 0-255 gauge
+    reading, so it is passed through and only clamped to the valid range.
+    """
+    if len(data) < 4:
+        return []
+    table_id = data[1]
+    tanks: list[TankLevel] = []
+    idx = 2
+    while idx + 1 < len(data):
+        level_pct = min(100, data[idx + 1])
+        _LOGGER.debug("Tank %02x:%02x level=%d%%", table_id, data[idx], level_pct)
+        tanks.append(
+            TankLevel(table_id=table_id, device_id=data[idx], level=level_pct)
+        )
+        idx += 2
+    return tanks
+
+
+def parse_tank_status_v2(data: bytes) -> TankLevel | None:
+    """Parse TankSensorStatusV2 (0x1B) — single tank per event.
+
+    Format: [0x1B][tableId][deviceId][status...], where the status block is
+    either 1 or 8 bytes.  Its first byte carries the fill percentage (0-100)
+    in bits 0-6; bit 7 is a status flag and is masked off.
+    """
+    if len(data) < 4:
+        return None
+    level_pct = min(100, data[3] & 0x7F)
+    _LOGGER.debug("Tank v2 %02x:%02x level=%d%%", data[1], data[2], level_pct)
+    return TankLevel(table_id=data[1], device_id=data[2], level=level_pct)
+
+
+def parse_dimmable_light(data: bytes) -> DimmableLight | None:
+    """Parse DimmableLightStatus (0x08).
+
+    INTERNALS.md § Dimmable Light:
+      11-byte frame: brightness at data[6] (statusBytes[3])
+      5-byte legacy:  brightness at data[4]
+    """
+    if len(data) < 5:
+        return None
+    mode = data[3]
+    brightness = data[6] if len(data) >= 7 else data[4]
+    return DimmableLight(
+        table_id=data[1],
+        device_id=data[2],
+        brightness=brightness,
+        mode=mode,
+    )
+
+
+def parse_rgb_light(data: bytes) -> RgbLight | None:
+    """Parse RgbLightStatus (0x09)."""
+    if len(data) < 5:
+        return None
+    mode = data[3]
+    # Extended format has RGB at offsets 4,5,6
+    r = data[4] if len(data) > 4 else 0
+    g = data[5] if len(data) > 5 else 0
+    b = data[6] if len(data) > 6 else 0
+    # No brightness byte in this frame — derive from max of R/G/B channels.
+    # data[7] is AutoOff (minutes), not brightness.
+    bright = max(r, g, b)
+    return RgbLight(
+        table_id=data[1],
+        device_id=data[2],
+        mode=mode,
+        red=r,
+        green=g,
+        blue=b,
+        brightness=bright,
+    )
+
+
+def parse_generator_status(data: bytes) -> GeneratorStatus | None:
+    """Parse GeneratorGenie status (0x0A).
+
+    Android reference: handleGeneratorGenieStatus()
+    Frame (8+ bytes): [0x0A][tableId][deviceId][status0][battH][battL][tempH][tempL]
+      status0 bits 0-2: state enum (0=Off,1=Priming,2=Starting,3=Running,4=Stopping)
+      status0 bit 7:    QuietHoursActive
+      bytes 4-5: battery voltage, unsigned 8.8 big-endian fixed-point (volts)
+      bytes 6-7: temperature, signed 8.8 big-endian fixed-point (°C);
+                 0x8000 = not supported, 0x7FFF = sensor invalid
+    """
+    if len(data) < 8:
+        return None
+    status0 = data[3] & 0xFF
+    batt_raw = (data[4] << 8) | data[5]
+    temp_raw = (data[6] << 8) | data[7]
+    if temp_raw in (0x8000, 0x7FFF):
+        temperature_c = None
+    else:
+        signed = temp_raw - 0x10000 if temp_raw >= 0x8000 else temp_raw
+        temperature_c = signed / 256.0
+    return GeneratorStatus(
+        table_id=data[1],
+        device_id=data[2],
+        state=status0 & 0x07,
+        battery_voltage=batt_raw / 256.0,
+        temperature_c=temperature_c,
+        quiet_hours=bool(status0 & 0x80),
+    )
+
+
+def _decode_temp_88(raw: int) -> float | None:
+    """Decode a signed 8.8 fixed-point temperature value.
+
+    Sentinels: 0x8000, 0x2FF0 → invalid / unavailable.
+    """
+    if raw in (0x8000, 0x2FF0, 0xFFFF):
+        return None
+    signed = raw - 0x10000 if raw >= 0x8000 else raw
+    return signed / 256.0
+
+
+def parse_hvac_status(data: bytes) -> list[HvacZone]:
+    """Parse HvacStatus (0x0B) — multiple zones, 11 bytes each.
+
+    INTERNALS.md § HVAC Status Event:
+      [0x0B][tableId] then per zone (11B):
+        [devId][cmdByte][lowTrip][highTrip][zoneStatus]
+        [indoorH][indoorL][outdoorH][outdoorL][dtcH][dtcL]
+    """
+    if len(data) < 4:
+        return []
+    table_id = data[1]
+    BYTES_PER_ZONE = 11
+    zones: list[HvacZone] = []
+    offset = 2
+    while offset + BYTES_PER_ZONE <= len(data):
+        device_id = data[offset]
+        cmd = data[offset + 1]
+        low_f = data[offset + 2]
+        high_f = data[offset + 3]
+        status = data[offset + 4]
+        indoor_raw = (data[offset + 5] << 8) | data[offset + 6]
+        outdoor_raw = (data[offset + 7] << 8) | data[offset + 8]
+        dtc = (data[offset + 9] << 8) | data[offset + 10]
+
+        zones.append(
+            HvacZone(
+                table_id=table_id,
+                device_id=device_id,
+                heat_mode=cmd & 0x07,
+                heat_source=(cmd >> 4) & 0x03,
+                fan_mode=(cmd >> 6) & 0x03,
+                low_trip_f=low_f,
+                high_trip_f=high_f,
+                zone_status=status & 0x8F,
+                indoor_temp_f=_decode_temp_88(indoor_raw),
+                outdoor_temp_f=_decode_temp_88(outdoor_raw),
+                dtc_code=dtc,
+            )
+        )
+        offset += BYTES_PER_ZONE
+    return zones
+
+
+def parse_cover_status(data: bytes) -> CoverStatus | None:
+    """Parse H-Bridge status (0x0D/0x0E).
+
+    INTERNALS.md § Cover/Slide/Awning:
+      STATE-ONLY — no control commands published.
+      Position: 0xFF = unavailable.
+    """
+    if len(data) < 4:
+        return None
+    pos = data[4] if len(data) > 4 else None
+    if pos is not None and pos == 0xFF:
+        pos = None
+    return CoverStatus(
+        table_id=data[1],
+        device_id=data[2],
+        status=data[3],
+        position=pos,
+    )
+
+
+def parse_real_time_clock(data: bytes) -> RealTimeClock | None:
+    """Parse RealTimeClock (0x20) — 7 bytes after event type."""
+    if len(data) < 8:
+        return None
+    return RealTimeClock(
+        year=data[1] + 2000,
+        month=data[2],
+        day=data[3],
+        hour=data[4],
+        minute=data[5],
+        second=data[6],
+        weekday=data[7],
+    )
+
+
+def parse_hour_meter(data: bytes) -> HourMeter | None:
+    """Parse HourMeter (0x0F).
+
+    Frame: [0x0F][tableId][deviceId][opSec3][opSec2][opSec1][opSec0][statusBits]
+    Android ref: handleHourMeterStatus() — BytesPerDevice=6 starting at offset 2.
+    OperatingSeconds is a big-endian uint32; statusBits carries maintenance flags.
+    """
+    if len(data) < 8:
+        return None
+    operating_seconds = int.from_bytes(data[3:7], "big")
+    status_bits = data[7]
+    return HourMeter(
+        table_id=data[1],
+        device_id=data[2],
+        hours=operating_seconds / 3600.0,
+        maintenance_due=bool(status_bits & 0x02),
+        maintenance_past_due=bool(status_bits & 0x04),
+        error=bool(status_bits & 0x20),
+    )
+
+
+def parse_leveler_status(data: bytes) -> LevelerStatus | None:
+    """Parse Leveler status (0x10).
+
+    Format: [0x10][tableId][deviceId][status][position]
+      status bit 0: is_active (leveler operating)
+      status bit 1: level_achieved (desired level reached)
+      position: 0=retracted, 1=extended, 2=mid, 3=error
+    """
+    if len(data) < 5:
+        return None
+    status = data[3]
+    return LevelerStatus(
+        table_id=data[1],
+        device_id=data[2],
+        is_active=bool(status & 0x01),
+        position_code=data[4] if len(data) > 4 else 0,
+        level_achieved=bool(status & 0x02),
+    )
+
+
+def parse_tank_alert(data: bytes) -> TankAlert | None:
+    """Parse TankAlert status.
+
+    Tank alerts are triggered when level crosses thresholds or connectivity lost.
+    Format: [type][tableId][deviceId][alertType][isTriggered]
+    """
+    if len(data) < 5:
+        return None
+    return TankAlert(
+        table_id=data[1],
+        device_id=data[2],
+        alert_type=data[3],
+        is_triggered=bool(data[4]),
+    )
+
+
+def parse_metadata_response(data: bytes) -> list[DeviceMetadata]:
+    """Parse GetDevicesMetadata response (event 0x02).
+
+    INTERNALS.md § Device Metadata Retrieval:
+      [cmdIdL][cmdIdH][0x02][??][tableId][startId][count] + entries...
+      Each entry: [protocol][payloadSize][...payload...]
+      Function name at payload offset 0-1 is **BIG-ENDIAN**.
+      Accept protocol 1 (Host) AND 2 (IdsCan) with payloadSize == 17.
+    """
+    if len(data) < 7:
+        return []
+
+    table_id = data[4] & 0xFF
+    start_id = data[5] & 0xFF
+    count = data[6] & 0xFF
+
+    # Log raw frame for field diagnostics — helps identify unknown gateway variants.
+    hex_preview = data.hex(" ").upper()
+    _LOGGER.debug(
+        "Metadata frame raw (table=%d start=%d count=%d len=%d): %s",
+        table_id, start_id, count, len(data), hex_preview,
+    )
+
+    results: list[DeviceMetadata] = []
+    offset = 7
+    index = 0
+
+    while index < count and offset + 2 < len(data):
+        protocol = data[offset] & 0xFF
+        payload_size = data[offset + 1] & 0xFF
+
+        if (
+            protocol in (METADATA_PROTOCOL_HOST, METADATA_PROTOCOL_IDS_CAN)
+            and payload_size == METADATA_PAYLOAD_SIZE_FULL
+            and offset + 2 + payload_size <= len(data)
+        ):
+            # Function name: BIG-ENDIAN 16-bit (INTERNALS.md critical note)
+            func_hi = data[offset + 2] & 0xFF
+            func_lo = data[offset + 3] & 0xFF
+            func_name = (func_hi << 8) | func_lo
+            func_instance = data[offset + 4] & 0xFF
+
+            device_id = (start_id + index) & 0xFF
+            _LOGGER.debug(
+                "Metadata entry[%d]: table=%d device=0x%02x protocol=%d "
+                "payload_size=%d func=0x%04x inst=%d",
+                index, table_id, device_id, protocol, payload_size,
+                func_name, func_instance,
+            )
+            results.append(
+                DeviceMetadata(
+                    table_id=table_id,
+                    device_id=device_id,
+                    function_name=func_name,
+                    function_instance=func_instance,
+                )
+            )
+        elif protocol == METADATA_PROTOCOL_HOST and payload_size == 0:
+            # Host device with no IDS CAN metadata — Gateway RVLink default.
+            # Reference: Android OneControlDevicePlugin.kt handleGetDevicesMetadataResponse()
+            # func=323 (0x0143) "Gateway RVLink", instance=15
+            device_id = (start_id + index) & 0xFF
+            _LOGGER.debug(
+                "Metadata entry[%d]: table=%d device=0x%02x protocol=%d "
+                "payload_size=0 (legacy Host, defaulting to Gateway RVLink func=323 inst=15)",
+                index, table_id, device_id, protocol,
+            )
+            results.append(
+                DeviceMetadata(
+                    table_id=table_id,
+                    device_id=device_id,
+                    function_name=323,
+                    function_instance=15,
+                )
+            )
+        else:
+            # Unknown protocol/payload combination — log clearly so we can identify
+            # new gateway variants or firmware versions in the field.
+            device_id = (start_id + index) & 0xFF
+            entry_hex = data[offset : offset + 2 + min(payload_size, 32)].hex(" ").upper()
+            _LOGGER.warning(
+                "Metadata entry[%d]: UNKNOWN combination — table=%d device=0x%02x "
+                "protocol=0x%02x payload_size=%d — skipping. Raw: %s",
+                index, table_id, device_id, protocol, payload_size, entry_hex,
+            )
+
+        offset += payload_size + 2
+        index += 1
+
+    if len(results) != count:
+        _LOGGER.warning(
+            "Metadata count mismatch for table=%d: frame declared %d entries, "
+            "decoded %d (skipped %d). This may indicate an unknown protocol variant.",
+            table_id, count, len(results), count - len(results),
+        )
+
+    return results
+
+
+# ── Dispatcher ────────────────────────────────────────────────────────────
+
+
+def parse_event(data: bytes) -> Any:
+    """Dispatch a decoded COBS frame to the appropriate parser.
+
+    Returns a parsed dataclass, list, or the raw bytes for unknown types.
+    """
+    if not data:
+        return None
+    event_type = data[0]
+
+    if event_type == EVENT_GATEWAY_INFORMATION:
+        return parse_gateway_information(data)
+    if event_type == EVENT_RV_STATUS:
+        return parse_rv_status(data)
+    if event_type in (EVENT_RELAY_BASIC_LATCHING_1, EVENT_RELAY_BASIC_LATCHING_2):
+        return parse_relay_status(data)
+    if event_type == EVENT_DEVICE_ONLINE_STATUS:
+        return parse_device_online(data)
+    if event_type == EVENT_DEVICE_LOCK_STATUS:
+        return parse_device_lock(data)
+    if event_type == EVENT_TANK_SENSOR:
+        return parse_tank_status(data)
+    if event_type == EVENT_TANK_SENSOR_V2:
+        return parse_tank_status_v2(data)
+    if event_type == EVENT_TANK_ALERT:
+        return parse_tank_alert(data)
+    if event_type == EVENT_DIMMABLE_LIGHT:
+        return parse_dimmable_light(data)
+    if event_type == EVENT_RGB_LIGHT:
+        return parse_rgb_light(data)
+    if event_type == EVENT_GENERATOR_GENIE:
+        return parse_generator_status(data)
+    if event_type == EVENT_HVAC_STATUS:
+        return parse_hvac_status(data)
+    if event_type in (EVENT_HBRIDGE_1, EVENT_HBRIDGE_2):
+        return parse_cover_status(data)
+    if event_type == EVENT_HOUR_METER:
+        return parse_hour_meter(data)
+    if event_type == EVENT_LEVELER:
+        return parse_leveler_status(data)
+    if event_type == EVENT_REAL_TIME_CLOCK:
+        return parse_real_time_clock(data)
+    if event_type == EVENT_DEVICE_COMMAND:
+        return parse_metadata_response(data)
+    # SESSION_STATUS (0x1A) — heartbeat, just log
+    if event_type == EVENT_SESSION_STATUS:
+        return None
+
+    # Return raw bytes for truly unknown events
+    return data
