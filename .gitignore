@@ -1,3 +1,6 @@
 .worktrees/
 .superpowers/
 uv.lock.bak
+__pycache__/
+*.pyc
+.venv/
