@@ -510,3 +510,61 @@ def test_learn_data_family_warns_when_candidate_table_differs(rvcw_home, monkeyp
     assert "0x01" in result.output and "0x02" in result.output
     saved = (rvcw_home / "lights.toml").read_text()
     assert "table = 0x01" in saved  # the OBSERVED relay table is what gets saved
+
+
+def test_cli_learn_non_interactive_device_filter_saves_only_that_device(
+    rvcw_home, monkeypatch
+):
+    """`learn NAME --device 0x09 --yes` toggles ONLY the requested device and
+    saves it without prompting — the non-interactive path (no TTY for confirm)."""
+    from rvcw import cli as cli_mod
+    import rvcw.discovery as discovery_mod
+    import rvcw.executor as executor_mod
+
+    toggled: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(executor_mod, "open_gateway", fake_data_open_gateway)
+    ctx_holder: dict = {}
+    original_fake = fake_data_open_gateway
+
+    @asynccontextmanager
+    async def fake_open(config, observed=None):
+        async with original_fake(config, observed) as pair:
+            ctx_holder["link"] = pair[0]
+            yield pair
+
+    monkeypatch.setattr(executor_mod, "open_gateway", fake_open)
+
+    async def fake_collect_relay_states(glink, table, window_s=3.0):
+        glink.relay_states = {(0x0B, 0x08): False, (0x0B, 0x09): False}
+        return dict(glink.relay_states)
+
+    monkeypatch.setattr(discovery_mod, "collect_relay_states", fake_collect_relay_states)
+
+    real_sleep = asyncio.sleep
+
+    async def quick_sleep(delay, *args, **kwargs):
+        await real_sleep(min(delay, 0.01))
+
+    monkeypatch.setattr(cli_mod.asyncio, "sleep", quick_sleep)
+
+    from rvcw import lights as lights_mod
+    from rvcw.ble.controller import CobsRelayLink
+    from rvcw.lights import LightTarget
+
+    real_write = CobsRelayLink.write
+
+    async def recording_write(self, target: LightTarget, on: bool) -> None:
+        toggled.append((target.device_id, on))
+        await real_write(self, target, on)
+
+    monkeypatch.setattr(CobsRelayLink, "write", recording_write)
+
+    from rvcw.cli import cli
+
+    result = CliRunner().invoke(cli, ["learn", "hall", "--device", "0x09", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert toggled == [(0x09, False), (0x09, True), (0x09, False)]  # only 0x09; OFF-first
+    saved = (rvcw_home / "lights.toml").read_text()
+    assert "0x0B" in saved and "0x0009" in saved
+    assert "0x08" not in saved  # the untoggled candidate stays unconfigured

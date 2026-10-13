@@ -68,8 +68,10 @@ def _targets_label(entries: list[LightEntry]) -> str:
     )
 
 
-def _parse_device_id(_ctx, _param, value: str) -> int:
+def _parse_device_id(_ctx, _param, value: str | None) -> int | None:
     """Accept decimal and 0x-prefixed hex device ids (plain `int` rejects hex)."""
+    if value is None:
+        return None
     try:
         return int(value, 0)
     except ValueError:
@@ -427,9 +429,14 @@ def discover() -> None:
 @click.option(
     "--yes",
     is_flag=True,
-    help="save the first matching candidate without confirming",
+    help="save the matching candidate without prompting",
 )
-def learn(name: str, yes: bool) -> None:
+@click.option(
+    "--device",
+    callback=_parse_device_id,
+    help="non-interactive: toggle/save only this device id (use with --yes)",
+)
+def learn(name: str, yes: bool, device: int | None) -> None:
     """Guided toggle-and-observe mapping: NAME gets a relay from candidates."""
 
     async def run():
@@ -448,6 +455,14 @@ def learn(name: str, yes: bool) -> None:
             table = link.gateway_info.table_id  # open_gateway waited for it
             states = await collect_relay_states(link, table, window_s=3.0)
             candidates = sorted(link.relay_states) or sorted(states)
+            if device is not None:
+                # Non-interactive: one candidate only. (table, device) keys.
+                candidates = [(t, d) for (t, d) in candidates if d == device]
+                if not candidates:
+                    click.echo(
+                        f"device 0x{device:02X} not among reported relays", err=True
+                    )
+                    raise SystemExit(1)
             if not candidates:
                 click.echo("no relays reported; try again with HA idle", err=True)
                 raise SystemExit(1)
@@ -472,7 +487,7 @@ def learn(name: str, yes: bool) -> None:
                         await controller.write(target, False)
                     except Exception:
                         pass  # link is gone; nothing to command anymore
-                if yes or click.confirm(f"Was that {name}?"):
+                if device is not None or yes or click.confirm(f"Was that {name}?"):
                     # the OBSERVED relay table is what gets saved; if it differs
                     # from the announced table, say so loudly (warn-only)
                     _check_mismatch(link, {table_id}, name)
