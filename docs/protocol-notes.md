@@ -136,3 +136,23 @@ form: `tomli_w.dumps` writes a `"0x2E41"` value as a quoted string (rejected
 by the loader) and a plain int as decimal — never as `0x…`. The hex-integer
 requirement alone justifies the raw-text writer; tomli-w was removed from
 `pyproject.toml` dependencies in Task 12 (unused by shipped code).
+
+## On-site session (2026-10-13, legacy COBS gateway — live device)
+
+- Panel relays discovered via GetDevices broadcast: **table 0x0B**;
+  devices **0x07** (water pump — unconfigured), **0x08** (front cap light),
+  **0x09** (hall light). These are the only pure-toggle targets; the rig's
+  other lights are dimmable/etc. (future: CMD_ACTION_DIMMABLE 0x43 path).
+- Mappings via `learn --device … --yes` (non-interactive): hall = 0x0B/0x09,
+  front_cap = 0x0B/0x08. Water pump intentionally left unmapped.
+- First selftest (blocking-supervision build, 5 WPM): misses=0,
+  rtt_ms≈558 — RelayStatus echo can lag ~0.5 s; executor redesigned to
+  asynchronous echo supervision (commit 8c93d9d) — writes never wait on
+  echoes; misses counted post-hoc; no mid-send abort from echo lag.
+- After the async redesign: selftest "R" at 5 WPM reads crisp; first real
+  send ("CQ CQ CQ DE RV", hall, 5 WPM): sent, echo first=0 ms max=153 ms
+  on the warm link.
+- Echo latency is SUPERVISORY only — it does not gate pacing and is not
+  used for the WPM advisory on this family (the physical actuation lag is
+  what the operator perceives; 5 WPM reads clean).
+- Operator default now wpm = 5 in ~/.config/rvcw/config.toml.
