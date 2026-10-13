@@ -1,6 +1,8 @@
 """Bleak-based gateway link over the host's BlueZ (D-Bus multiplexed)."""
 from __future__ import annotations
 
+import asyncio
+
 from typing import Callable
 
 from bleak import BleakClient
