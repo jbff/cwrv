@@ -12,8 +12,10 @@ def rvcw_home(tmp_path, monkeypatch):
     home = tmp_path / "rvcw"
     home.mkdir()
     monkeypatch.setenv("RVCW_HOME", str(home))
+    # byte-sized device id: data-path device ids are single bytes on the wire
+    # (build_action_switch masks to one byte) and load_map REJECTS larger ones
     (home / "lights.toml").write_text(
-        "[lights.awning]\ntable = 0x00\ndevice = 0x2E41\n"
+        "[lights.awning]\ntable = 0x00\ndevice = 0x2E\n"
     )
     return home
 
@@ -25,7 +27,7 @@ def test_send_dry_run_lists_schedule(rvcw_home):
     assert result.exit_code == 0, result.output
     # new (table, device) addressing is shown per target
     assert "table=0x00" in result.output
-    assert "device=0x2E41" in result.output
+    assert "device=0x002E" in result.output
     assert "ON    150ms" in result.output
 
 
@@ -47,12 +49,25 @@ def test_send_old_style_lights_toml_fails_fast(rvcw_home):
     assert "removed device_id key" in result.output
 
 
+def test_send_rejects_over_range_device_id_cleanly(rvcw_home):
+    """Minor A through the CLI: a lights.toml device entry above one byte is
+    a clean (traced) error naming the light, not a masked wrong-relay send."""
+    from rvcw.cli import cli
+
+    (rvcw_home / "lights.toml").write_text(
+        "[lights.awning]\ntable = 0x00\ndevice = 0x2E41\n"
+    )
+    result = CliRunner().invoke(cli, ["send", "E", "--light", "awning", "--dry-run"])
+    assert result.exit_code != 0
+    assert "light 'awning': device id 0x2E41 exceeds one byte" in result.output
+
+
 def test_lights_list(rvcw_home):
     from rvcw.cli import cli
 
     result = CliRunner().invoke(cli, ["lights"])
     assert result.exit_code == 0
-    assert "awning" in result.output and "0x2E41" in result.output and "table=0x00" in result.output
+    assert "awning" in result.output and "0x002E" in result.output and "table=0x00" in result.output
 
 
 # ---- learn: Ctrl-C during the ON->dwell->OFF walk must not latch ON --------
@@ -316,6 +331,53 @@ def test_sniff_formatter_highlights_relay_and_gateway_rows():
 
     other = cli._describe_data_event(bytes([0x07, 0x00, 0x0B]))
     assert "RV" in other or "0x07" in other  # decoded, never a crash
+
+
+# ---- Minor B: wrong-PIN / silent-gateway auth failures exit cleanly --------
+# send's except tuple must include GatewayAuthError (raised by
+# open_gateway → authenticate_data / unlock_gateway for a wrong PIN or a
+# silent gateway) and selftest's must include LinkError AND GatewayAuthError:
+# a failure there exits 1 with the message, never a traceback.
+
+
+def test_send_wrong_pin_exits_cleanly(rvcw_home, monkeypatch):
+    from rvcw.ble.transport import GatewayAuthError
+
+    import rvcw.executor as executor_mod
+
+    @asynccontextmanager
+    async def fake_open(config, observed=None):
+        raise GatewayAuthError("PIN unlock failed — verify= (wrong PIN)")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(executor_mod, "open_gateway", fake_open)
+
+    from rvcw.cli import cli
+
+    result = CliRunner().invoke(cli, ["send", "E", "--light", "awning"])
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "aborted: PIN unlock failed" in result.output
+
+
+def test_selftest_wrong_pin_exits_cleanly(rvcw_home, monkeypatch):
+    from rvcw.ble.transport import LinkError
+
+    import rvcw.executor as executor_mod
+
+    @asynccontextmanager
+    async def fake_open(config, observed=None):
+        raise LinkError("connection dropped during auth")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(executor_mod, "open_gateway", fake_open)
+
+    from rvcw.cli import cli
+
+    result = CliRunner().invoke(cli, ["selftest", "--light", "awning"])
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "selftest FAILED: connection dropped during auth" in result.output
 
 
 # ---- review fix 3: saved-table vs announced-table mismatch is loud ----------

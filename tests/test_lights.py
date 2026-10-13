@@ -83,6 +83,38 @@ def test_combo_missing_member_raises(tmp_path):
         m.resolve("bad")
 
 
+def test_device_id_over_one_byte_is_rejected_at_load(tmp_path):
+    """Minor A: build_action_switch masks device bytes (& 0xFF), so an
+    over-range mapping would silently target a different relay — load raises
+    naming the light and the value."""
+    p = write(tmp_path, "[lights.awning]\ntable = 0x01\ndevice = 0x2E41\n")
+    with pytest.raises(
+        ValueError,
+        match="light 'awning': device id 0x2E41 exceeds one byte",
+    ):
+        load_map(p)
+
+
+def test_device_id_under_zero_is_rejected_at_load(tmp_path):
+    p = write(tmp_path, "[lights.awning]\ntable = 0x01\ndevice = -1\n")
+    with pytest.raises(ValueError, match="light 'awning': device id"):
+        load_map(p)
+
+
+def test_device_id_full_byte_range_accepted(tmp_path):
+    for device_id in (0x00, 0x2E, 0xFF):
+        p = save_light(tmp_path / "lights.toml", "awning", 0x01, device_id)
+        assert load_map(p).resolve("awning")[0].device_id == device_id
+
+
+def test_save_light_rejects_over_range_device_id(tmp_path):
+    with pytest.raises(
+        ValueError,
+        match="light 'awning': device id 0x2E41 exceeds one byte",
+    ):
+        save_light(tmp_path / "lights.toml", "awning", 0x01, 0x2E41)
+
+
 def test_save_light_roundtrip(tmp_path):
     p = save_light(tmp_path / "lights.toml", "awning", 0x01, 0x2E)
     reloaded = load_map(p)

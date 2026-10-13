@@ -84,6 +84,7 @@ def load_map(path: Path) -> LightMap:
                 f"light '{name}' needs both a 'table' and a 'device' entry "
                 f"in {path}"
             )
+        _check_device_id(name, int(v["device"]))
         lights[name] = LightEntry(name, int(v["table"]), int(v["device"]))
     combos = {}
     for k, v in data.get("combos", {}).items():
@@ -95,6 +96,21 @@ def load_map(path: Path) -> LightMap:
 def _check_name(name: str) -> None:
     if not _NAME_RE.fullmatch(name):
         raise ValueError(f"invalid light name {name!r} (want [a-z][a-z0-9_]*)")
+
+
+# The vendored build_action_switch (and the wire) carry a device id in ONE
+# byte (`d & 0xFF`), and RelayStatus confirms arrive keyed by that byte: a
+# mapping stored with device_id > 0xFF would silently command the WRONG
+# relay instead of failing. Reject at load and at save.
+_MAX_DEVICE_ID = 0xFF
+
+
+def _check_device_id(name: str, device_id: int) -> None:
+    if not 0 <= device_id <= _MAX_DEVICE_ID:
+        raise ValueError(
+            f"light '{name}': device id 0x{device_id:X} exceeds one byte "
+            f"(max 0x{_MAX_DEVICE_ID:02X}) — check the light's mapping"
+        )
 
 
 def _write(m: LightMap, path: Path) -> None:
@@ -117,6 +133,7 @@ def _write(m: LightMap, path: Path) -> None:
 def save_light(path: Path, name: str, table_id: int, device_id: int) -> LightMap:
     path = _as_path(path)
     _check_name(name)
+    _check_device_id(name, device_id)
     m = load_map(path)
     m.lights[name] = LightEntry(name, table_id, device_id)
     _write(m, path)

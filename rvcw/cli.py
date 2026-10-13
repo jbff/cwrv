@@ -115,7 +115,7 @@ def send(text: str, light: str, wpm: int | None, repeat: int, dry_run: bool, no_
             click.echo(f"{'ON ' if s.on else 'off'}{s.ms:6d}ms")
         return
 
-    from .ble.transport import LinkError
+    from .ble.transport import GatewayAuthError, LinkError
     from .executor import SendAborted, SendStats, open_gateway, send_steps
 
     confirm_timeout = max(0.05, (1200 / wpm) / 1000 * 0.8)
@@ -143,7 +143,9 @@ def send(text: str, light: str, wpm: int | None, repeat: int, dry_run: bool, no_
     except TableMismatch as exc:
         click.echo(str(exc), err=True)
         raise SystemExit(1) from None
-    except (SendAborted, RemoteControlSessionError, LinkError) as exc:
+    except (
+        SendAborted, RemoteControlSessionError, LinkError, GatewayAuthError
+    ) as exc:
         click.echo(f"aborted: {exc}", err=True)
         raise SystemExit(1) from None
     if stats.rtt_ms is not None and stats.rtt_ms > 0:
@@ -166,6 +168,7 @@ def selftest(light: str) -> None:
         msg = str(exc.args[0]) if exc.args else str(exc)
         raise click.ClickException(msg) from None
 
+    from .ble.transport import GatewayAuthError, LinkError
     from .executor import SendAborted, SendStats, open_gateway, send_steps
 
     async def run() -> SendStats:
@@ -182,7 +185,9 @@ def selftest(light: str) -> None:
 
     try:
         stats = asyncio.run(run())
-    except (SendAborted, RemoteControlSessionError) as exc:
+    except (
+        SendAborted, RemoteControlSessionError, LinkError, GatewayAuthError
+    ) as exc:
         click.echo(f"selftest FAILED: {exc}", err=True)
         raise SystemExit(1) from None
     click.echo(f"selftest OK: misses={stats.misses} rtt_ms={stats.rtt_ms}")
