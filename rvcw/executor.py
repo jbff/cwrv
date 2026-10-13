@@ -110,7 +110,7 @@ async def send_steps(
         if not await rc.ensure(device_id):
             raise RemoteControlSessionError(f"no session for 0x{device_id:02X}")
 
-    pre = {d: link.relay_states.get(d) for d in device_ids}
+    pre = {d: link.can_relay_states.get(d) for d in device_ids}
     stats = SendStats()
     start = time.monotonic()
     pos = 0.0

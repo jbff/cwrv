@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 
 from rvcw import config
-from rvcw.ble.transport import GatewayLink
+from rvcw.ble.transport import GatewayLink, GatewayAuthError as GatewayUnlockError
 from rvcw.protocol import (
     CAN_BLE_KEY_SEED_CIPHER,
     KEY_CHAR_UUID,
@@ -20,8 +20,9 @@ from rvcw.protocol import (
 from rvcw.protocol.ids_can_wire import ids_can_response_name
 
 
-class GatewayUnlockError(RuntimeError):
-    pass
+# Key/seed-unlock errors share the data-path auth exception type (see
+# rvcw.ble.transport.GatewayAuthError) — one catch covers both BLE auth flows.
+# GatewayUnlockError is kept as the historical name of that alias.
 
 
 async def unlock_gateway(link: GatewayLink) -> None:

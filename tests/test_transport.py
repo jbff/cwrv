@@ -37,7 +37,7 @@ def test_unconnected_write_raises():
         link.client
 
 
-def test_relay_states_updated_from_device_status(monkeypatch):
+def test_can_relay_states_updated_from_device_status(monkeypatch):
     # Fake a derived status parser (real one arrives in Task 9)
     monkeypatch.setattr(
         GatewayLink,
@@ -48,4 +48,5 @@ def test_relay_states_updated_from_device_status(monkeypatch):
     # V2 ElevenBit notification: [0x02][..][..][type=DEVICE_STATUS][addr=0x41][dlc=1][status=0x01]
     status_frame = bytes([0x02, 0x00, 0x00, 0x03, 0x41, 0x01, 0x01])
     link._on_notification(status_frame)
-    assert link.relay_states[0x41] is True
+    assert link.can_relay_states[0x41] is True  # CAN view is int-keyed
+    assert link.relay_states == {}  # data-path dict stays untouched by CAN frames

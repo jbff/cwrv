@@ -19,11 +19,11 @@ class TimelineLink:
 
     def __init__(self, confirm_on_write_no: int = 0, confirm_delay_s: float = 0.0):
         self.local_host_address = 0x2D
-        self.relay_states: dict[int, bool] = {}
+        self.can_relay_states: dict[int, bool] = {}
         self.writes: list[tuple[float, int, bool]] = []  # (t_s, target, on)
         self._t0 = None
         self.on_frame = None
-        # Confirm simulation: mark relay_states once this device has received
+        # Confirm simulation: mark can_relay_states once this device has received
         # this many TYPE-2 relay writes (0 = never confirms; 1 = immediate).
         self.confirm_on_write_no = confirm_on_write_no
         # DEVICE_STATUS latency: the confirmation lands this many seconds
@@ -46,16 +46,16 @@ class TimelineLink:
 
     def _confirm_later(self, device_id: int, on: bool) -> None:
         if self.confirm_delay_s <= 0.0:
-            self.relay_states[device_id] = on
+            self.can_relay_states[device_id] = on
         else:
             loop = asyncio.get_running_loop()
             loop.call_later(self.confirm_delay_s, self._mark_state, device_id, on)
 
     def _mark_state(self, device_id: int, on: bool) -> None:
-        self.relay_states[device_id] = on
+        self.can_relay_states[device_id] = on
 
     def mark(self, device_id: int, on: bool) -> None:
-        self.relay_states[device_id] = on
+        self.can_relay_states[device_id] = on
 
 
 class FakeRC:
@@ -95,7 +95,7 @@ async def test_schedule_write_times_match_elements():
 
 
 async def test_abort_on_two_consecutive_misses():
-    # confirm requested but the fake link NEVER updates relay_states
+    # confirm requested but the fake link NEVER updates can_relay_states
     link = TimelineLink()
     rc = FakeRC()
 

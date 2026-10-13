@@ -109,14 +109,18 @@ _CONFIRM_POLL_INTERVAL_S = 0.05
 
 
 async def confirm_relay(link: GatewayLink, device_id: int, on: bool, timeout: float) -> bool:
-    """Poll DEVICE_STATUS-derived relay state until the deadline."""
+    """Poll DEVICE_STATUS-derived relay state until the deadline.
+
+    Reads the CAN-path state view (int-keyed by participant address); the
+    data-path COBS family keeps its tuple-keyed ``relay_states`` separately.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        state = link.relay_states.get(device_id)
+        state = link.can_relay_states.get(device_id)
         if state is on:
             return True
         await asyncio.sleep(_CONFIRM_POLL_INTERVAL_S)
-    return link.relay_states.get(device_id) is on
+    return link.can_relay_states.get(device_id) is on
 
 
 async def set_relay(

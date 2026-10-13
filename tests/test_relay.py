@@ -25,7 +25,7 @@ class FakeLink:
 
     def __init__(self, local_host: int | None = 0x2D):
         self.local_host_address = local_host
-        self.relay_states: dict[int, bool] = {}
+        self.can_relay_states: dict[int, bool] = {}
         self.written: list[bytes] = []
         self.on_frame = None
 
@@ -51,7 +51,7 @@ class FakeRC:
 )
 async def test_confirm_relay_identity_comparison(state, on, expected):
     link = FakeLink()
-    link.relay_states[0x2E] = state
+    link.can_relay_states[0x2E] = state
     assert await confirm_relay(link, 0x2E, on, timeout=0.0) is expected
 
 
@@ -60,7 +60,7 @@ async def test_confirm_relay_true_when_state_appears_while_polling():
 
     async def appear() -> None:
         await asyncio.sleep(0.08)
-        link.relay_states[0x2E] = True
+        link.can_relay_states[0x2E] = True
 
     task = asyncio.create_task(appear())
     assert await confirm_relay(link, 0x2E, True, timeout=0.5) is True
@@ -74,7 +74,7 @@ async def test_confirm_relay_false_when_never_confirmed():
 
 async def test_confirm_relay_ignores_other_devices():
     link = FakeLink()
-    link.relay_states[0x41] = True
+    link.can_relay_states[0x41] = True
     assert await confirm_relay(link, 0x2E, True, timeout=0.12) is False
 
 
@@ -133,7 +133,7 @@ async def test_set_relay_succeeds_on_rewrite():
     async def write(frame: bytes) -> None:
         link.written.append(frame)
         if len(link.written) >= 2:  # only the rewrite reaches the device
-            link.relay_states[0x2E] = True
+            link.can_relay_states[0x2E] = True
 
     link.write_can_frame = write
     await set_relay(link, FakeRC(), 0x2E, True, confirm_timeout=0.5)
@@ -145,6 +145,6 @@ def _confirming_write(link: FakeLink, states: dict[int, bool]):
         link.written.append(frame)
         wire = parse_ids_can_wire_frame(frame)
         if wire is not None and wire.message_type == 0x82:
-            link.relay_states.update(states)
+            link.can_relay_states.update(states)
 
     return write

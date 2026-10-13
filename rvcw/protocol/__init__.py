@@ -17,6 +17,13 @@ from .ids_can_wire import (
     parse_ids_can_wire_frame,
 )
 from .function_names import FUNCTION_NAMES
+from .commands import CommandBuilder
+from .events import (
+    GatewayInformation,
+    parse_event,
+    parse_gateway_information,
+    parse_relay_status,
+)
 from .const import (  # noqa: F401
     CAN_READ_CHAR_UUID,
     CAN_VERSION_CHAR_UUID,
