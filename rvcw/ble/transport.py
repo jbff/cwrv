@@ -93,12 +93,24 @@ class GatewayLink:
     async def connect(self) -> None:
         """Connect with service-discovery retries (upstream parity: the panel's
         GATT sometimes reports an incomplete service set right after connect —
-        HA's boot log showed the same "missing CAN_WRITE" quirk)."""
+        HA's boot log showed the same "missing CAN_WRITE" quirk).
+
+        BlueZ caches the GATT enumeration per device across clients, so a
+        partial enumeration persists until the device link is dropped — we
+        disconnect at the BlueZ level (devices auto-reconnect for HA) to force
+        a fresh enumeration when the required chars are missing.
+        """
         required = (CAN_READ_CHAR_UUID, CAN_WRITE_CHAR_UUID)
         client: BleakClient | None = None
-        for attempt in range(3):
-            client = BleakClient(self.mac)
-            await client.connect()
+        last_error: Exception | None = None
+        for attempt in range(4):
+            try:
+                client = BleakClient(self.mac)
+                await client.connect()
+            except Exception as exc:  # e.g. BlueZ InProgress during HA churn
+                last_error = exc
+                await asyncio.sleep(1.5 + attempt)
+                continue
             try:
                 if hasattr(client, "request_mtu"):
                     await client.request_mtu(185)  # best-effort, as upstream does
@@ -106,17 +118,28 @@ class GatewayLink:
                 pass
             chars = {c.uuid for s in client.services for c in s.characteristics}
             if all(u in chars for u in required):
-                break
+                self._client = client
+                await client.start_notify(
+                    CAN_READ_CHAR_UUID,
+                    lambda _c, data: self._on_notification(bytes(data)),
+                )
+                return
             try:
                 await client.disconnect()
             except Exception:
                 pass
-            await asyncio.sleep(0.5)
-        assert client is not None
-        self._client = client
-        await client.start_notify(
-            CAN_READ_CHAR_UUID,
-            lambda _c, data: self._on_notification(bytes(data)),
+            # Drop the device link at BlueZ level: discards its cached GATT db
+            # (all clients re-enumerate); HA's coordinator auto-reconnects.
+            proc = await asyncio.create_subprocess_exec(
+                "bluetoothctl", "disconnect", self.mac,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            await asyncio.sleep(1.0)
+        raise LinkError(
+            f"could not obtain the full GATT service set "
+            f"(CAN_READ/CAN_WRITE) after retries: {last_error}"
         )
 
     def _on_notification(self, data: bytes) -> None:
