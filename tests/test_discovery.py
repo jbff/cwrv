@@ -305,3 +305,47 @@ async def _async_noop(*args, **kw):
 
 def _claim_noop(link, observed):
     return _async_noop()
+
+
+# ---- Task 14: data-path relay-state discovery -------------------------------
+
+
+async def test_collect_relay_states_broadcasts_get_devices_once_and_snapshots():
+    from rvcw.discovery import collect_relay_states
+    from rvcw.protocol.commands import CommandBuilder
+
+    class DataLink:
+        def __init__(self):
+            self.relay_states: dict[tuple[int, int], bool] = {}
+            self.sent: list[bytes] = []
+
+        async def send_command(self, raw: bytes) -> None:
+            self.sent.append(raw)
+            async def later():
+                await asyncio.sleep(0.05)
+                self.relay_states[(0x02, 0x2E)] = True
+            asyncio.create_task(later())
+
+    link = DataLink()
+    states = await collect_relay_states(link, 0x02, window_s=0.15)
+    assert states == {(0x02, 0x2E): True}  # state echoed inside the window
+    assert len(link.sent) == 1  # exactly ONE broadcast
+    # [cid2][0x01 GetDevices][table][0x00 0xFF]
+    assert link.sent[0][2] == CommandBuilder.CMD_GET_DEVICES
+    assert link.sent[0][3] == 0x02
+
+
+def test_collect_relay_states_is_a_snapshot_not_a_live_view():
+    import asyncio as aio
+    from rvcw.discovery import collect_relay_states
+
+    class DataLink:
+        relay_states = {(0x02, 0x2E): False}
+
+        async def send_command(self, raw: bytes) -> None:
+            pass
+
+    link = DataLink()
+    states = aio.run(collect_relay_states(link, 0x02, window_s=0.01))
+    states[(0x02, 0x2F)] = True
+    assert (0x02, 0x2F) not in link.relay_states  # mutating the snapshot is safe

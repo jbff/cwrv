@@ -1,4 +1,4 @@
-"""Named lights/combos -> IDS-CAN device addresses, persisted as TOML."""
+"""Named lights/combos -> (table, device) relay addresses, persisted as TOML."""
 from __future__ import annotations
 
 import re
@@ -10,21 +10,35 @@ _NAME_RE = re.compile(r"[a-z][a-z0-9_]*")
 
 
 @dataclass(frozen=True)
+class LightTarget:
+    """One addressable data-path relay: table_id + device_id (COBS path)."""
+
+    table_id: int
+    device_id: int
+
+    @property
+    def key(self) -> tuple[int, int]:
+        """The (table_id, device_id) pair keying GatewayLink.relay_states."""
+        return (self.table_id, self.device_id)
+
+
+@dataclass(frozen=True)
 class LightEntry:
     name: str
+    table_id: int
     device_id: int
 
 
 @dataclass
 class LightMap:
-    lights: dict[str, int]
+    lights: dict[str, LightEntry]
     combos: dict[str, list[str]]
     path: Path
 
     def _resolve_one(self, name: str) -> LightEntry:
         if name not in self.lights:
             raise KeyError(f"{name!r} not in {self.path}")
-        return LightEntry(name, self.lights[name])
+        return self.lights[name]
 
     def resolve(self, name: str) -> list[LightEntry]:
         """Resolve a light or combo name to member light entries."""
@@ -44,17 +58,33 @@ def _as_path(arg: Path | LightMap) -> Path:
     return arg.path if isinstance(arg, LightMap) else arg
 
 
+def _removed_key_error(name: str) -> ValueError:
+    return ValueError(
+        f"light '{name}' uses the removed device_id key — re-run learn for "
+        "the COBS path"
+    )
+
+
 def load_map(path: Path) -> LightMap:
     path = _as_path(path)
     if not path.exists():
         return LightMap({}, {}, path)
     with path.open("rb") as f:
         data = tomllib.load(f)
-    # TOML shape is [lights.NAME] device_id = 0x... / [combos.NAME] members = [...],
-    # i.e. each entry is a sub-table, not a flat scalar.
-    lights = {}
+    # TOML shape is [lights.NAME] table = 0x… / device = 0x… and
+    # [combos.NAME] members = [...], i.e. each entry is a sub-table.
+    # The pre-COBS device_id key is REMOVED: load raises instead of remapping.
+    lights: dict[str, LightEntry] = {}
     for k, v in data.get("lights", {}).items():
-        lights[str(k)] = int(v["device_id"]) if isinstance(v, dict) else int(v)
+        name = str(k)
+        if not isinstance(v, dict) or "device_id" in v:
+            raise _removed_key_error(name)
+        if "table" not in v or "device" not in v:
+            raise ValueError(
+                f"light '{name}' needs both a 'table' and a 'device' entry "
+                f"in {path}"
+            )
+        lights[name] = LightEntry(name, int(v["table"]), int(v["device"]))
     combos = {}
     for k, v in data.get("combos", {}).items():
         members = v["members"] if isinstance(v, dict) else v
@@ -68,24 +98,27 @@ def _check_name(name: str) -> None:
 
 
 def _write(m: LightMap, path: Path) -> None:
-    # tomli_w has no unsigned-int hex form: a "0x2E41" value is emitted as a
-    # quoted string, which breaks the device_id = 0x... integer round-trip.
+    # tomli_w has no unsigned-int hex form: a "0x2E" value is emitted as a
+    # quoted string, which breaks the table/device = 0x... integer round-trip.
     # All names and members passed here are regex-validated, so the document
     # is emitted as raw text with bare keys and simple quoted strings.
     lines: list[str] = []
-    for k, v in sorted(m.lights.items()):
-        lines.append(f"[lights.{k}]\ndevice_id = 0x{v:04X}\n")
+    for k, entry in sorted(m.lights.items()):
+        lines.append(
+            f"[lights.{k}]\ntable = 0x{entry.table_id:02X}\n"
+            f"device = 0x{entry.device_id:04X}\n"
+        )
     for k, members in sorted(m.combos.items()):
         quoted = ", ".join(f'"{member}"' for member in members)
         lines.append(f"[combos.{k}]\nmembers = [{quoted}]\n")
     path.write_text("\n".join(lines))
 
 
-def save_light(path: Path, name: str, device_id: int) -> LightMap:
+def save_light(path: Path, name: str, table_id: int, device_id: int) -> LightMap:
     path = _as_path(path)
     _check_name(name)
     m = load_map(path)
-    m.lights[name] = device_id
+    m.lights[name] = LightEntry(name, table_id, device_id)
     _write(m, path)
     return load_map(path)
 

@@ -5,13 +5,17 @@ import time
 import pytest
 
 from rvcw.protocol import parse_ids_can_wire_frame
+from rvcw.protocol.commands import CommandBuilder
 
+from rvcw.ble.controller import CanRelayLink, CobsRelayLink
 from rvcw.ble.transport import LinkError
 from rvcw.config import GatewayConfig
 from rvcw.executor import SendAborted, SendStats, send_steps
+from rvcw.lights import LightTarget
 from rvcw.morse import Step
 
 CONFIG = GatewayConfig(mac="FA:KE")  # reconnect fake ignores it
+T = LightTarget(0x00, 0x2E)  # CAN-family target (table unused by the CAN path)
 
 
 class TimelineLink:
@@ -74,13 +78,40 @@ class FakeRC:
         self.closes += 1
 
 
+def can_controller(link, rc=None) -> CanRelayLink:
+    return CanRelayLink(link, rc or FakeRC())  # type: ignore[arg-type]
+
+
+class DataTimelineLink:
+    """COBS data-path link double: parses switch commands, echoes the state."""
+
+    def __init__(self, confirm_on_write: bool = True):
+        self.relay_states: dict[tuple[int, int], bool] = {}
+        self.commands: list[tuple[float, bytes]] = []  # (t_s, raw command)
+        self._t0 = None
+        self.on_frame = None
+        self.confirm_on_write = confirm_on_write
+
+    async def send_command(self, raw: bytes) -> None:
+        if self._t0 is None:
+            self._t0 = time.monotonic()
+        self.commands.append((time.monotonic() - self._t0, raw))
+        if self.confirm_on_write:
+            table, state = raw[3], raw[4] == 0x01
+            for d in raw[5:]:
+                self.relay_states[(table, d)] = state
+
+
+# ---- CAN family: pacing / supervision / off-guarantee (byte-equal pins) ----
+
+
 async def test_schedule_write_times_match_elements():
     # A = [on 150, off 150, on 450]
     link = TimelineLink()
-    rc = FakeRC()  # type: ignore[arg-type]
+    controller = can_controller(link)
     # bypass confirm: confirm=False path
     stats = await send_steps(
-        link, rc, [0x2E], [Step(True, 150), Step(False, 150), Step(True, 450)],
+        link, controller, [T], [Step(True, 150), Step(False, 150), Step(True, 450)],
         config=CONFIG, confirm=False,
     )  # type: ignore[arg-type]
     assert isinstance(stats, SendStats)
@@ -97,11 +128,11 @@ async def test_schedule_write_times_match_elements():
 async def test_abort_on_two_consecutive_misses():
     # confirm requested but the fake link NEVER updates can_relay_states
     link = TimelineLink()
-    rc = FakeRC()
+    controller = can_controller(link)
 
     with pytest.raises(SendAborted):
         await send_steps(
-            link, rc, [0x2E], [Step(True, 150), Step(False, 150)],
+            link, controller, [T], [Step(True, 150), Step(False, 150)],
             config=CONFIG, confirm=True, confirm_timeout=0.05,
         )  # type: ignore[arg-type]
 
@@ -110,7 +141,7 @@ async def test_off_restore_when_pre_state_unknown():
     """No DEVICE_STATUS seen pre-send -> the off-guarantee forces OFF."""
     link = TimelineLink()
     stats = await send_steps(
-        link, FakeRC(), [0x2E], [Step(True, 100), Step(False, 100)],
+        link, can_controller(link), [T], [Step(True, 100), Step(False, 100)],
         config=CONFIG, confirm=False,
     )
     on_writes = [w for w in link.writes if w[2]]
@@ -126,7 +157,7 @@ async def test_restore_returns_to_known_pre_state():
     link = TimelineLink()
     link.mark(0x2E, True)  # pre-send DEVICE_STATUS says ON
     await send_steps(
-        link, FakeRC(), [0x2E], [Step(True, 100), Step(False, 100)],
+        link, can_controller(link), [T], [Step(True, 100), Step(False, 100)],
         config=CONFIG, confirm=False,
     )
     restores = link.writes[-1]
@@ -138,7 +169,7 @@ async def test_rewrite_on_missed_confirm_counts_miss_and_completes():
     one miss counted, consecutive counter reset, send completes, restore off."""
     link = TimelineLink(confirm_on_write_no=2)
     stats = await send_steps(
-        link, FakeRC(), [0x2E], [Step(True, 100), Step(False, 100)],
+        link, can_controller(link), [T], [Step(True, 100), Step(False, 100)],
         config=CONFIG, confirm=True, confirm_timeout=0.05,
     )
     assert stats.misses == 1
@@ -151,7 +182,7 @@ async def test_rewrite_on_missed_confirm_counts_miss_and_completes():
 async def test_rtt_measured_on_first_confirmed_element():
     link = TimelineLink(confirm_on_write_no=1)
     stats = await send_steps(
-        link, FakeRC(), [0x2E], [Step(True, 100), Step(False, 100)],
+        link, can_controller(link), [T], [Step(True, 100), Step(False, 100)],
         config=CONFIG, confirm=True, confirm_timeout=0.5,
     )
     assert stats.rtt_ms is not None
@@ -175,7 +206,7 @@ async def test_restore_failure_is_counted_not_raised():
 
     link = DyingLink()
     stats = await send_steps(
-        link, FakeRC(), [0x2E], [Step(True, 100), Step(False, 100)],
+        link, can_controller(link), [T], [Step(True, 100), Step(False, 100)],
         config=CONFIG, confirm=False,
     )
     assert stats.restore_failures == 1
@@ -190,11 +221,11 @@ async def test_confirm_latency_does_not_drift_next_write_boundary():
     ≈250 ms).
     """
     link = TimelineLink(confirm_on_write_no=1, confirm_delay_s=0.10)
-    rc = FakeRC()  # type: ignore[arg-type]
+    controller = can_controller(link)
     await send_steps(
-        link, rc, [0x2E], [Step(True, 150), Step(False, 150)],
+        link, controller, [T], [Step(True, 150), Step(False, 150)],
         config=CONFIG, confirm=True, confirm_timeout=0.5,
-    )  # type: ignore[arg-type]
+    )
     # PINNING-ASSERT (second write lands on its scheduled boundary):
     assert 0.145 <= link.writes[1][0] < 0.17, link.writes
 
@@ -202,10 +233,77 @@ async def test_confirm_latency_does_not_drift_next_write_boundary():
 async def test_empty_device_ids_rejected():
     link = TimelineLink()
     with pytest.raises(ValueError):
-        await send_steps(link, FakeRC(), [], [Step(True, 100)], config=CONFIG)
+        await send_steps(link, can_controller(link), [], [Step(True, 100)], config=CONFIG)
 
 
-# ---- spec §Safety "Reconnect" (mid-message BLE loss, resume once) --------
+# ---- Review Focus 5: combos pass per-target writes, never one bulk write ----
+
+
+async def test_two_can_targets_write_one_command_per_device():
+    link = TimelineLink()
+    targets = [LightTarget(0x00, 0x2E), LightTarget(0x00, 0x2F)]
+    await send_steps(
+        link, can_controller(link), targets, [Step(True, 100)], config=CONFIG, confirm=False
+    )
+    # 1 element turn = 2 writes (one per target) + 2 forced-OFF restores
+    assert len(link.writes) == 4
+    assert [(w[1], w[2]) for w in link.writes] == [
+        (0x2E, True), (0x2F, True), (0x2E, False), (0x2F, False),
+    ]
+
+
+# ---- data family: CobsRelayLink drives the same schedule --------------------
+
+
+async def test_data_two_targets_write_one_command_per_device_not_bulk():
+    link = DataTimelineLink()
+    controller = CobsRelayLink(link)  # type: ignore[arg-type]
+    targets = [LightTarget(0x01, 0x2E), LightTarget(0x01, 0x2F)]
+    await send_steps(
+        link, controller, targets, [Step(True, 100)], config=CONFIG, confirm=False
+    )  # type: ignore[arg-type]
+    # Review Focus 5 pinned: each Switch write carries a SINGLE device id —
+    # the combo never collapses into one multi-device bulk write.
+    assert len(link.commands) == 4  # 2 element writes + 2 forced-OFF restores
+    for _t, raw in link.commands:
+        # [cid2][0x40 ActionSwitch][table][state][device...]
+        assert (raw[2], raw[3]) == (CommandBuilder.CMD_ACTION_SWITCH, 0x01)
+        assert list(raw[5:]) == [0x2E] or list(raw[5:]) == [0x2F]
+
+
+async def test_data_restore_returns_to_known_pre_state():
+    link = DataTimelineLink()
+    link.relay_states[(0x01, 0x2E)] = True  # pre-send RelayStatus says ON
+    await send_steps(
+        link, CobsRelayLink(link), [LightTarget(0x01, 0x2E)],
+        [Step(True, 100), Step(False, 100)], config=CONFIG, confirm=False,
+    )  # type: ignore[arg-type]
+    restore = link.commands[-1][1]
+    assert restore[4] == 0x01  # final write is ON, matching the pre-state
+
+
+async def test_data_off_restore_when_pre_state_unknown():
+    link = DataTimelineLink()
+    stats = await send_steps(
+        link, CobsRelayLink(link), [LightTarget(0x01, 0x2E)],
+        [Step(True, 100), Step(False, 100)], config=CONFIG, confirm=False,
+    )  # type: ignore[arg-type]
+    # element on, element off, restore off (pre-state unknown -> forced OFF)
+    assert [raw[4] for _t, raw in link.commands] == [0x01, 0x00, 0x00]
+    assert stats.restore_failures == 0
+
+
+async def test_data_aborts_on_two_consecutive_missed_confirms():
+    link = DataTimelineLink(confirm_on_write=False)
+    with pytest.raises(SendAborted):
+        await send_steps(
+            link, CobsRelayLink(link), [LightTarget(0x01, 0x2E)],
+            [Step(True, 150), Step(False, 150)], config=CONFIG,
+            confirm=True, confirm_timeout=0.05,
+        )  # type: ignore[arg-type]
+
+
+# ---- spec §Safety "Reconnect" (mid-message BLE loss, resume once) ----------
 
 
 class FlakyLink(TimelineLink):
@@ -241,7 +339,7 @@ async def test_link_loss_reconnects_once_and_resumes_remaining_schedule(monkeypa
     monkeypatch.setattr(executor, "reconnect_gateway", fake_reconnect)
 
     stats = await send_steps(
-        link, rc, [0x2E], steps, config=CONFIG, confirm=False
+        link, can_controller(link, rc), [T], steps, config=CONFIG, confirm=False
     )
     assert link.reconnects == 1
     # resumed at the CURRENT position: no step restarted, so each element is
@@ -270,7 +368,7 @@ async def test_second_link_failure_raises_link_error(monkeypatch):
 
     with pytest.raises(LinkError):
         await send_steps(
-            link, FakeRC(), [0x2E], [Step(True, 100), Step(False, 100)],
+            link, can_controller(link), [T], [Step(True, 100), Step(False, 100)],
             config=CONFIG, confirm=False,
         )
     assert link.reconnects == 1  # exactly one reconnect attempt, then abort
@@ -288,5 +386,5 @@ async def test_failed_reconnect_raises_immediately(monkeypatch):
 
     with pytest.raises(LinkError, match="reconnect itself failed"):
         await send_steps(
-            link, FakeRC(), [0x2E], [Step(True, 100)], config=CONFIG, confirm=False
+            link, can_controller(link), [T], [Step(True, 100)], config=CONFIG, confirm=False
         )

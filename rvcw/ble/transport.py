@@ -148,6 +148,9 @@ class GatewayLink:
         self.pin = pin
         self._client: BleakClient | None = None
         self.on_frame: Callable[[IdsCanWireFrame | bytes], None] | None = None
+        # Data path: every decoded COBS frame (relay + gateway-info included),
+        # for the CLI sniff that must SEE frames the internal dispatch consumes.
+        self.on_data_event: Callable[[bytes], None] | None = None
         # Data path (COBS): relay state keyed (table_id, device_id).
         self.relay_states: dict[tuple[int, int], bool] = {}
         # CAN path: DEVICE_STATUS relay state keyed by participant address.
@@ -320,7 +323,14 @@ class GatewayLink:
         self._decoder = CobsByteDecoder()  # fresh state for a new session
         # Upstream order: DATA_READ first, then SEED.
         await client.start_notify(DATA_READ_CHAR_UUID, self._on_data_read)
-        await client.start_notify(SEED_CHAR_UUID, self._on_seed_notification)
+        try:
+            await client.start_notify(SEED_CHAR_UUID, self._on_seed_notification)
+        except Exception as exc:
+            _log.warning(
+                "SEED char (0x0011) not subscribable (%s) — step-2/PIN auth "
+                "cannot run; continuing without it (connect-style tolerance)",
+                exc,
+            )
 
     async def _authenticate_step2(self, seed: bytes) -> None:
         """SEED notification handler: step-2 auth (16-byte PIN key to KEY)."""
@@ -339,7 +349,12 @@ class GatewayLink:
             return
         key = calculate_step2_key(seed, self.pin)
         client = self.client
-        await client.write_gatt_char(KEY_CHAR_UUID, key, response=False)
+        try:
+            await client.write_gatt_char(KEY_CHAR_UUID, key, response=False)
+        except Exception as exc:
+            _log.warning("step-2: auth key write failed (%s) — the gateway "
+                         "may stay locked; notifications keep flowing", exc)
+            return
         _log.info("step-2: auth key written — authentication complete")
 
     def _on_data_read(
@@ -360,6 +375,13 @@ class GatewayLink:
         """Dispatch one decoded COBS frame."""
         if not frame:
             return
+        if self.on_data_event is not None:
+            # raw-event hook first: the CLI sniff sees every frame, including
+            # the kinds the internal dispatch swallows below
+            try:
+                self.on_data_event(frame)
+            except Exception:
+                _log.warning("on_data_event hook failed", exc_info=True)
         kind = frame[0]
         if kind == EVENT_GATEWAY_INFORMATION:
             info = parse_gateway_information(frame)

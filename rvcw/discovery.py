@@ -12,6 +12,7 @@ from rvcw.protocol import (
     compose_ids_can_extended_wire_frame,
     parse_ids_can_wire_frame,
 )
+from rvcw.protocol.commands import CommandBuilder
 
 
 @dataclass(frozen=True)
@@ -76,3 +77,18 @@ async def collect_devices(
     finally:
         link.on_frame = previous
     return sorted(found.values(), key=lambda d: d.address)
+
+
+async def collect_relay_states(
+    link: GatewayLink, table: int, window_s: float = 3.0
+) -> dict[tuple[int, int], bool]:
+    """Data-path discovery: one GetDevices broadcast, then snapshot relay_states.
+
+    The gateway answers the broadcast with RelayStatus events for every known
+    device; the transport's notification path accumulates
+    ``link.relay_states``. Returns a SNAPSHOT (a copy) so callers walking /
+    mutating it never race the live notification dict.
+    """
+    await link.send_command(CommandBuilder().build_get_devices(table))
+    await asyncio.sleep(window_s)
+    return dict(link.relay_states)

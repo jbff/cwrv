@@ -12,7 +12,9 @@ def rvcw_home(tmp_path, monkeypatch):
     home = tmp_path / "rvcw"
     home.mkdir()
     monkeypatch.setenv("RVCW_HOME", str(home))
-    (home / "lights.toml").write_text("[lights.awning]\ndevice_id = 0x2E41\n")
+    (home / "lights.toml").write_text(
+        "[lights.awning]\ntable = 0x00\ndevice = 0x2E41\n"
+    )
     return home
 
 
@@ -21,7 +23,9 @@ def test_send_dry_run_lists_schedule(rvcw_home):
 
     result = CliRunner().invoke(cli, ["send", "E", "--light", "awning", "--dry-run"])
     assert result.exit_code == 0, result.output
-    assert "0x2E41" in result.output
+    # new (table, device) addressing is shown per target
+    assert "table=0x00" in result.output
+    assert "device=0x2E41" in result.output
     assert "ON    150ms" in result.output
 
 
@@ -33,12 +37,22 @@ def test_send_unknown_light_fails_fast(rvcw_home):
     assert "ghost" in result.output
 
 
+def test_send_old_style_lights_toml_fails_fast(rvcw_home):
+    """The removed device_id mapping surfaces as a Click error, not a traceback."""
+    from rvcw.cli import cli
+
+    (rvcw_home / "lights.toml").write_text("[lights.awning]\ndevice_id = 0x2E41\n")
+    result = CliRunner().invoke(cli, ["send", "E", "--light", "awning", "--dry-run"])
+    assert result.exit_code != 0
+    assert "removed device_id key" in result.output
+
+
 def test_lights_list(rvcw_home):
     from rvcw.cli import cli
 
     result = CliRunner().invoke(cli, ["lights"])
     assert result.exit_code == 0
-    assert "awning" in result.output and "0x2E41" in result.output
+    assert "awning" in result.output and "0x2E41" in result.output and "table=0x00" in result.output
 
 
 # ---- learn: Ctrl-C during the ON->dwell->OFF walk must not latch ON --------
@@ -115,3 +129,190 @@ def test_learn_ctrl_c_during_dwell_still_commands_off(rvcw_home, monkeypatch):
         and w.message_data == 0x00
     ]
     assert (0x33, 0x00) in off_frames
+
+
+# ---- data family (COBS): discover / learn on fake links --------------------
+
+
+class FakeDataLink:
+    """GatewayLink stand-in for a connected legacy-COBS gateway."""
+
+    def __init__(self, mac, pin=None):
+        from rvcw.protocol.events import GatewayInformation
+
+        self.family = "data"
+        self.mac = mac
+        self.pin = pin
+        self.gateway_info = GatewayInformation(table_id=0x02)
+        self.authed = False
+        self.keepalive = False
+        self.closed = False
+        self.relay_states: dict[tuple[int, int], bool] = {}
+        self.commands: list[bytes] = []
+
+    async def connect(self) -> None:
+        pass
+
+    async def authenticate_data(self, pin) -> None:
+        self.authed = True
+
+    async def wait_gateway_info(self, timeout: float = 10.0) -> int:
+        return 0x02
+
+    async def start_keepalive(self) -> None:
+        self.keepalive = True
+
+    async def send_command(self, raw: bytes) -> None:
+        self.commands.append(raw)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _install_fake_gateway_link(monkeypatch, link_cls):
+    import rvcw.ble.transport as transport_mod
+
+    monkeypatch.setattr(transport_mod, "GatewayLink", link_cls)
+
+
+def test_cli_discover_data_family_prints_table_device_on_rows(rvcw_home, monkeypatch):
+    import rvcw.discovery as discovery_mod
+
+    from rvcw.cli import cli
+
+    tables: list[int] = []
+    seen: list = []
+
+    async def fake_collect_relay_states(glink, table, window_s=3.0):
+        tables.append(table)
+        seen.append(glink)
+        glink.relay_states = {(0x02, 0x2E): True, (0x02, 0x2F): False}
+        return dict(glink.relay_states)
+
+    _install_fake_gateway_link(monkeypatch, FakeDataLink)
+    monkeypatch.setattr(discovery_mod, "collect_relay_states", fake_collect_relay_states)
+
+    result = CliRunner().invoke(cli, ["discover"])
+    assert result.exit_code == 0, result.output
+    (link,) = seen
+    assert link.authed and link.keepalive and link.closed  # auth + keepalive + teardown
+    assert tables == [0x02]  # one GetDevices broadcast for the announced table
+    assert "relay table=0x02 device=0x2E on=True" in result.output
+    assert "relay table=0x02 device=0x2F on=False" in result.output
+
+
+def test_cli_discover_data_family_no_relays_is_an_error(rvcw_home, monkeypatch):
+    import rvcw.discovery as discovery_mod
+
+    from rvcw.cli import cli
+
+    class EmptyLink(FakeDataLink):
+        def __init__(self, mac, pin=None):
+            super().__init__(mac, pin)
+            self.relay_states = {}
+
+    async def fake_collect_relay_states(glink, table, window_s=3.0):
+        return {}
+
+    _install_fake_gateway_link(monkeypatch, EmptyLink)
+    monkeypatch.setattr(discovery_mod, "collect_relay_states", fake_collect_relay_states)
+
+    result = CliRunner().invoke(cli, ["discover"])
+    assert result.exit_code == 1
+    assert "no relays reported" in result.output
+
+
+@asynccontextmanager
+async def fake_data_open_gateway(config, observed=None):
+    yield FakeDataLink("AA:BB"), None  # rc=None marks the data family
+
+
+def test_cli_learn_data_family_saves_table_and_device(rvcw_home, monkeypatch):
+    from rvcw import cli as cli_mod
+    import rvcw.discovery as discovery_mod
+    import rvcw.executor as executor_mod
+
+    monkeypatch.setattr(executor_mod, "open_gateway", fake_data_open_gateway)
+
+    async def fake_collect_relay_states(glink, table, window_s=3.0):
+        glink.relay_states = {(0x02, 0x2E): False}
+        return dict(glink.relay_states)
+
+    monkeypatch.setattr(discovery_mod, "collect_relay_states", fake_collect_relay_states)
+
+    real_sleep = asyncio.sleep
+
+    async def quick_sleep(delay, *args, **kwargs):
+        await real_sleep(min(delay, 0.01))
+
+    monkeypatch.setattr(cli_mod.asyncio, "sleep", quick_sleep)
+
+    from rvcw.cli import cli
+
+    result = CliRunner().invoke(cli, ["learn", "awning", "--yes"])
+    assert result.exit_code == 0, result.output
+    saved = (rvcw_home / "lights.toml").read_text()
+    assert "[lights.awning]" in saved
+    assert "table = 0x02" in saved
+    assert "device = 0x002E" in saved
+
+
+def test_cli_learn_data_family_offs_first_and_never_latches_on(rvcw_home, monkeypatch):
+    """Candidates come from relay_states keys; OFF first, ON, 0.6 s dwell,
+    finally-OFF — an abort anywhere (here: the declined confirm walk) can
+    never leave the light latched ON."""
+    from rvcw import cli as cli_mod
+    import rvcw.discovery as discovery_mod
+    import rvcw.executor as executor_mod
+
+    ctx_holder: dict = {}
+
+    @asynccontextmanager
+    async def fake_open(config, observed=None):
+        link = FakeDataLink("AA:BB")
+        ctx_holder["link"] = link
+        yield link, None
+
+    monkeypatch.setattr(executor_mod, "open_gateway", fake_open)
+
+    async def fake_collect_relay_states(glink, table, window_s=3.0):
+        glink.relay_states = {(0x02, 0x2E): False}
+        return dict(glink.relay_states)
+
+    monkeypatch.setattr(discovery_mod, "collect_relay_states", fake_collect_relay_states)
+
+    real_sleep = asyncio.sleep
+
+    async def quick_sleep(delay, *args, **kwargs):
+        await real_sleep(min(delay, 0.01))
+
+    monkeypatch.setattr(cli_mod.asyncio, "sleep", quick_sleep)
+
+    from rvcw.cli import cli
+
+    result = CliRunner().invoke(cli, ["learn", "awning"], input="n\n")
+    assert result.exit_code == 1, result.output
+    link = ctx_holder["link"]
+    # [cid2][0x40][table][state][device] — OFF, ON, then the finally-OFF
+    switches = [(raw[3], raw[5], raw[4] == 0x01) for raw in link.commands]
+    assert switches == [(0x02, 0x2E, False), (0x02, 0x2E, True), (0x02, 0x2E, False)]
+
+
+# ---- sniff: decoded COBS event rows ----------------------------------------
+
+
+def test_sniff_formatter_highlights_relay_and_gateway_rows():
+    from rvcw import cli
+
+    relay = cli._describe_data_event(bytes([0x05, 0x02, 0x2E, 0x01, 0x00]))
+    assert "RELAY" in relay
+    assert "table=0x02" in relay and "device=0x2E" in relay and "on=True" in relay
+
+    relay_off = cli._describe_data_event(bytes([0x06, 0x02, 0x2E, 0x11, 0x00]))
+    assert "RELAY" in relay_off and "on=True" in relay_off  # 0x11 IS on (vendored rule)
+
+    info = cli._describe_data_event(bytes([0x01, 0x02, 0x00, 0x05, 0x02]) + bytes(8))
+    assert "GATEWAY-INFO" in info and "table=0x02" in info
+
+    other = cli._describe_data_event(bytes([0x07, 0x00, 0x0B]))
+    assert "RV" in other or "0x07" in other  # decoded, never a crash

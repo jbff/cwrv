@@ -10,10 +10,12 @@ from dataclasses import dataclass
 
 from bleak import BleakError
 
-from .ble.can import claim_local_host, confirm_relay, relay_command
+from .ble.can import claim_local_host
+from .ble.controller import RelayController, link_family
 from .ble.session import RemoteControl, RemoteControlSessionError, unlock_gateway
 from .ble.transport import GatewayLink, LinkError
 from .config import GatewayConfig
+from .lights import LightTarget
 from .morse import Step
 
 _log = logging.getLogger(__name__)
@@ -25,15 +27,29 @@ _LINK_ERRORS = (LinkError, BleakError)
 @asynccontextmanager
 async def open_gateway(
     config: GatewayConfig, observed: set[int] | None = None
-) -> AsyncIterator[tuple[GatewayLink, RemoteControl]]:
-    """Connect + unlock + claim LocalHost; RC heartbeat cancelled on exit."""
+) -> AsyncIterator[tuple[GatewayLink, RemoteControl | None]]:
+    """Connect + family establishment; RC heartbeat cancelled on exit.
+
+    CAN family: key/seed unlock + LocalHost claim, yields the GatewayLink
+    with a fresh :class:`RemoteControl`. Data family (legacy COBS): step-1/2
+    auth + the gateway-info wait + the GetDevices keepalive, and yields
+    ``rc=None`` (no session machinery exists on that path).
+    """
     link = GatewayLink(config.mac, config.pin)
     rc: RemoteControl | None = None
     try:
         # inside try: close() still runs if a later step fails
-        await _establish(link, observed if observed is not None else set())
+        await link.connect()
+        if link_family(link) == "data":
+            await link.authenticate_data(config.pin)
+            await link.wait_gateway_info(timeout=10)
+            await link.start_keepalive()  # stopped by close() at teardown
+            yield link, None
+            return
         rc = RemoteControl(link)
         link.on_frame = rc.handle_frame
+        await unlock_gateway(link)
+        await claim_local_host(link, observed if observed is not None else set())
         yield link, rc
     finally:
         if rc is not None:
@@ -42,12 +58,18 @@ async def open_gateway(
 
 
 async def _establish(link: GatewayLink, observed: set[int]) -> None:
-    """Connect + key/seed-unlock + claim LocalHost, on this link object.
+    """Establish the gateway link on this link object (family-aware).
 
     Reused by :func:`open_gateway` and :func:`reconnect_gateway`; a reconnect
-    re-uses the same GatewayLink so callers keep one link/RC identity.
+    re-uses the same GatewayLink so callers keep one link/RC identity. For the
+    data family the COBS auth is the re-establishment itself (keepalive
+    restarts, skipped ticks until the gateway re-announces).
     """
     await link.connect()
+    if link_family(link) == "data":
+        await link.authenticate_data(link.pin)
+        await link.start_keepalive()
+        return
     await unlock_gateway(link)
     await claim_local_host(link, observed)
 
@@ -55,11 +77,12 @@ async def _establish(link: GatewayLink, observed: set[int]) -> None:
 async def reconnect_gateway(link: GatewayLink, config: GatewayConfig) -> None:
     """Re-establish the BLE gateway link once (spec §Safety "Reconnect").
 
-    Closes the dead link (if connected), then re-runs the full
-    connect/unlock/claim flow via the same :class:`GatewayLink` object. The
-    gateway drops REMOTE_CONTROL sessions with the BLE link, so callers must
-    reset their :class:`RemoteControl` (``aclose``) and ``ensure`` again
-    before further session-scoped writes.
+    Closes the dead link (if connected), then re-runs the family's
+    connect/auth flow via the same :class:`GatewayLink` object. The gateway
+    drops REMOTE_CONTROL sessions with the BLE link, so callers must reset
+    their :class:`RemoteControl` (``aclose``) and ``ensure`` again before
+    further session-scoped writes (the CAN controller does that in
+    ``ensure``); the data family just re-authenticates via the link.
     """
     try:
         await link.close()  # no-op when the client is already gone
@@ -83,8 +106,8 @@ class SendAborted(RuntimeError):
 
 async def send_steps(
     link: GatewayLink,
-    rc: RemoteControl,
-    device_ids: list[int],
+    controller: RelayController,
+    targets: list[LightTarget],
     steps: list[Step],
     *,
     config: GatewayConfig,
@@ -96,45 +119,48 @@ async def send_steps(
     The first write fires as soon as possible (there is no scheduled start
     delay); later writes land at their scheduled wall-clock times or later
     (a confirmation window that outlives its element never makes a write
-    early). DEVICE_STATUS confirmations are checked inside each element's
+    early). Relay-state confirmations are checked inside each element's
     window, with at most one idempotent rewrite per missed element; two
     consecutive missed elements abort. Mid-message link loss reconnects ONCE
     and resumes at the current schedule position; a second link failure (or a
     failed reconnect) aborts. EVERY exit path — including aborts and link
-    death — restores the pre-send state of every touched device (forced OFF
-    when the pre-state was unknown).
+    death — restores the pre-send state of every touched target (forced OFF
+    when the pre-state was unknown). Writes go through the family
+    :class:`RelayController`, one write per target.
     """
-    if not device_ids:
+    if not targets:
         raise ValueError("no devices to blink")
-    for device_id in device_ids:
-        if not await rc.ensure(device_id):
-            raise RemoteControlSessionError(f"no session for 0x{device_id:02X}")
+    for target in targets:
+        if not await controller.ensure(target):
+            raise RemoteControlSessionError(f"no session for 0x{target.device_id:02X}")
 
-    pre = {d: link.can_relay_states.get(d) for d in device_ids}
+    # Pre-send state keyed by (table, device); None = unknown -> forced OFF
+    # at restore. The controller picks the family's state view.
+    pre = {t.key: await controller.current_state(t) for t in targets}
     stats = SendStats()
     start = time.monotonic()
     pos = 0.0
     consecutive_misses = 0
 
-    async def confirm_one(device_id: int, on: bool) -> bool:
-        """DEVICE_STATUS check that also captures the first confirmed latency."""
+    async def confirm_one(target: LightTarget, on: bool) -> bool:
+        """Relay-state check that also captures the first confirmed latency."""
         t0 = time.monotonic()
-        ok = await confirm_relay(link, device_id, on, timeout=confirm_timeout)
+        ok = await controller.confirm(target, on, timeout=confirm_timeout)
         if ok and stats.rtt_ms is None:
             stats.rtt_ms = (time.monotonic() - t0) * 1000.0
         return ok
 
     async def resume_sessions() -> None:
-        """After a reconnect: re-register frame dispatch and rebuild sessions.
+        """After a reconnect: reset controller state and rebuild per target.
 
         The gateway drops every REMOTE_CONTROL session with the BLE link, and
-        latching-relay writes are idempotent, so re-ensuring every device is
-        always safe.
+        latching-relay writes are idempotent, so re-ensuring every target is
+        always safe. (The CobsRelayLink re-auth happened inside
+        reconnect_gateway via the link itself.)
         """
-        link.on_frame = rc.handle_frame
-        await rc.aclose()
-        for device_id in device_ids:
-            await rc.ensure(device_id)
+        await controller.aclose()
+        for target in targets:
+            await controller.ensure(target)
 
     link_failures = 0
     index = 0
@@ -144,25 +170,22 @@ async def send_steps(
             written = False  # did the element write itself land?
             try:
                 await asyncio.gather(*(
-                    link.write_can_frame(relay_command(link.local_host_address, d, step.on))
-                    for d in device_ids
+                    controller.write(t, step.on) for t in targets
                 ))
                 written = True
                 pos += step.ms  # AFTER the write: the first write is never delayed
                 if confirm:
                     confirmed = await asyncio.gather(*(
-                        confirm_one(d, step.on) for d in device_ids
+                        confirm_one(t, step.on) for t in targets
                     ))
                     if all(confirmed):
                         consecutive_misses = 0
                     else:
-                        # idempotent rewrite for unconfirmed devices (latching
+                        # idempotent rewrite for unconfirmed targets (latching
                         # relay: rewriting the same state is a no-op on the light)
-                        for d, ok in zip(device_ids, confirmed):
+                        for t, ok in zip(targets, confirmed):
                             if not ok:
-                                await link.write_can_frame(
-                                    relay_command(link.local_host_address, d, step.on)
-                                )
+                                await controller.write(t, step.on)
                                 stats.misses += 1
                         consecutive_misses += 1
                         if consecutive_misses >= 2:
@@ -188,18 +211,16 @@ async def send_steps(
                 await asyncio.sleep(delay)
             index += 1
     finally:
-        for d in device_ids:
-            state = pre.get(d)
+        for t in targets:
+            state = pre.get(t.key)
             state = state if state is not None else False
             try:
-                await link.write_can_frame(
-                    relay_command(link.local_host_address, d, state)
-                )
+                await controller.write(t, state)
             except Exception:
                 stats.restore_failures += 1
         if stats.restore_failures:
             _log.warning(
-                "link lost during restore for %d device(s); lights may not be "
+                "link lost during restore for %d target(s); lights may not be "
                 "back at pre-send state",
                 stats.restore_failures,
             )
