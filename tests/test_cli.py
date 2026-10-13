@@ -472,6 +472,7 @@ def test_selftest_warns_on_table_mismatch_but_runs(rvcw_home, monkeypatch):
     assert "warning" in result.output
     assert "table 0x00" in result.output and "0x02" in result.output
     assert "selftest OK" in result.output
+    assert "echoes:" in result.output  # data family also reports the echoes
 
 
 def test_learn_data_family_warns_when_candidate_table_differs(rvcw_home, monkeypatch):
@@ -568,3 +569,46 @@ def test_cli_learn_non_interactive_device_filter_saves_only_that_device(
     saved = (rvcw_home / "lights.toml").read_text()
     assert "0x0B" in saved and "0x0009" in saved
     assert "0x08" not in saved  # the untoggled candidate stays unconfigured
+
+
+# ---- review follow-up 2: data-family echo report (no WPM advisory) ----------
+
+
+def test_send_data_family_reports_echoes_and_skips_wpm_advisory(rvcw_home, monkeypatch):
+    """Data family: `echoes: first=… max=…` instead of the RTT/WPM advisory —
+    the echo is supervisory only and must not gate pacing advice. rtt 200 ms
+    at --wpm 4 WOULD trigger the advisory on CAN (max_wpm=3); it must not here."""
+    import re as re_mod
+
+    from rvcw.protocol.events import GatewayInformation
+
+    from rvcw.cli import cli
+
+    _byte_device_fixture(rvcw_home)
+    holder: dict = {}
+
+    class DelayedEchoLink(EchoDataLink):
+        echo_delay = 0.2  # > 90 ms advisory threshold, < confirm_timeout at 4 WPM
+
+        def __init__(self, mac, pin=None):
+            super().__init__(mac, pin)
+            self.gateway_info = GatewayInformation(table_id=0x00)
+
+        async def send_command(self, raw: bytes) -> None:
+            self.commands.append(raw)
+            loop = asyncio.get_running_loop()
+            loop.call_later(self.echo_delay, self._echo, raw)
+
+        def _echo(self, raw: bytes) -> None:
+            self.sent_to_relay = True
+            for d in raw[5:]:
+                self.relay_states[(raw[3], d)] = raw[4] == 0x01
+
+    _install_data_gateway(monkeypatch, holder, DelayedEchoLink)
+
+    result = CliRunner().invoke(cli, ["send", "E", "--light", "awning", "--wpm", "4"])
+    assert result.exit_code == 0, result.output
+    match = re_mod.search(r"echoes: first=(\d+)ms max=(\d+)ms", result.output)
+    assert match is not None, result.output
+    assert int(match.group(1)) >= 150  # the reported echo latency is real
+    assert "suggests" not in result.output  # the WPM advisory is SKIPPED

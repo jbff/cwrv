@@ -109,7 +109,10 @@ mode 600; also discoverable from HA's config-entry storage in container
    element's window. Source had no dedicated ack event — 0x02 frames are
    metadata responses — so state-confirmation, not ack-events, is the
    pacing verifier. A missed confirmation retries ONCE within the element;
-   two consecutive misses abort with the off-guarantee.
+   two consecutive misses abort with the off-guarantee. (Data-family note
+   2026-10-13: the RelayStatus echo can lag; supervision on the COBS path is
+   asynchronous — writes never wait on echoes, misses are counted post-hoc,
+   no mid-send abort from echo lag.)
 4. **Restore**: final commands return every touched light to its pre-send
    state (see Safety).
 
@@ -118,7 +121,8 @@ trip is measured live during each sending run; when the commanded WPM exceeds
 the measured RTT envelope (~60% of dit length), the CLI prints a warning with
 the suggested max WPM. In v1 this warning is advisory and arrives AFTER the
 run — a first-send auto-downscale is impossible without a pre-measured RTT
-(chicken-and-egg), and no RTT state is retained between runs yet. Once the
+(chicken-and-egg), and no RTT state is retained between runs yet. On the data
+family the RTT advisory is not used (the echo is supervisory only). Once the
 sniff capture (Task 9 Step 5) populates real RTT data, auto-downscale from the
 stored envelope becomes a follow-up. Expected envelope 8–15 WPM given
 BLE + status-feedback latency.

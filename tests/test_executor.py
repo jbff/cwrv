@@ -16,6 +16,7 @@ from rvcw.morse import Step
 
 CONFIG = GatewayConfig(mac="FA:KE")  # reconnect fake ignores it
 T = LightTarget(0x00, 0x2E)  # CAN-family target (table unused by the CAN path)
+T_DATA = LightTarget(0x01, 0x2E)  # data-family target
 
 
 class TimelineLink:
@@ -293,14 +294,10 @@ async def test_data_off_restore_when_pre_state_unknown():
     assert stats.restore_failures == 0
 
 
-async def test_data_aborts_on_two_consecutive_missed_confirms():
-    link = DataTimelineLink(confirm_on_write=False)
-    with pytest.raises(SendAborted):
-        await send_steps(
-            link, CobsRelayLink(link), [LightTarget(0x01, 0x2E)],
-            [Step(True, 150), Step(False, 150)], config=CONFIG,
-            confirm=True, confirm_timeout=0.05,
-        )  # type: ignore[arg-type]
+# (The former `test_data_aborts_on_two_consecutive_missed_confirms` pin was
+# RETIRED with the async-supervision ruling: on the data family a lagging or
+# lost echo must never abort the message — see
+# test_async_supervision_counts_misses_without_aborting.)
 
 
 # ---- spec §Safety "Reconnect" (mid-message BLE loss, resume once) ----------
@@ -448,3 +445,95 @@ async def test_data_family_reconnects_once_and_resumes_remaining_schedule():
     # resumed at the CURRENT position: the retried element is not re-sequenced
     assert link.commands[2][0] < 0.25
     assert stats.restore_failures == 0
+
+
+# ---- async (data-family) echo supervision -----------------------------------
+# Ruling: DATA-FAMILY SUPERVISION IS ASYNCHRONOUS — the RelayStatus echo
+# governs nothing about when the next write happens; misses are counted
+# post-hoc and never abort the message (a lagging echo cannot save the
+# message, and the gateway may still apply pending writes).
+
+
+class EchoLagLink:
+    """COBS data-path link with a configurable per-write echo delay."""
+
+    def __init__(self, delays: list[float]):
+        self.relay_states: dict[tuple[int, int], bool] = {}
+        self.commands: list[tuple[float, bytes]] = []
+        self._t0: float | None = None
+        self._delays = list(delays)  # per write; -1 = the echo never arrives
+        self.on_frame = None
+
+    async def send_command(self, raw: bytes) -> None:
+        if self._t0 is None:
+            self._t0 = time.monotonic()
+        self.commands.append((time.monotonic() - self._t0, raw))
+        delay = self._delays.pop(0) if self._delays else 0.0
+        if delay < 0:
+            return  # echo lost
+        if delay <= 0.0:
+            self._apply(raw)
+        else:
+            asyncio.get_running_loop().call_later(delay, self._apply, raw)
+
+    def _apply(self, raw: bytes) -> None:
+        table, state = raw[3], raw[4] == 0x01
+        for d in raw[5:]:
+            self.relay_states[(table, d)] = state
+
+
+async def test_async_supervision_does_not_stretch_next_write_boundary():
+    """Echo at +0.5 s, element boundary at 150 ms: the second write still
+    lands on its scheduled time — writes never wait on echoes."""
+    link = EchoLagLink([0.5, 0.5])
+    await send_steps(
+        link, CobsRelayLink(link), [T_DATA],
+        [Step(True, 150), Step(False, 150)],
+        config=CONFIG, confirm=True, confirm_timeout=1.0,
+    )
+    # PINNING-ASSERT (the drift-pin pattern): second write ≈ 150 ms despite
+    # the still-unconfirmed first element
+    assert 0.145 <= link.commands[1][0] < 0.20, link.commands
+
+
+async def test_async_supervision_counts_misses_without_aborting():
+    """ALL echoes lost: the message completes, every unconfirmed element is
+    counted as a miss, the restore runs — NO SendAborted in async mode."""
+    link = DataTimelineLink(confirm_on_write=False)  # echoes never arrive
+    stats = await send_steps(
+        link, CobsRelayLink(link), [T_DATA],
+        [Step(True, 100), Step(False, 100), Step(True, 100)],
+        config=CONFIG, confirm=True, confirm_timeout=0.05,
+    )
+    assert stats.misses == 3  # one unconfirmed target per element
+    assert stats.restore_failures == 0
+    # 3 element writes + the off-guarantee restore
+    assert len(link.commands) == 4
+    assert link.commands[-1][1][4] == 0x00  # restore ran
+
+
+async def test_async_supervision_reports_echo_max():
+    """Echoes at 100 ms then 400 ms: rtt_ms = first ok ≈ 100, echo_max_ms ≈ 400."""
+    link = EchoLagLink([0.10, 0.40])
+    stats = await send_steps(
+        link, CobsRelayLink(link), [T_DATA],
+        [Step(True, 150), Step(False, 150)],
+        config=CONFIG, confirm=True, confirm_timeout=1.0,
+    )
+    assert stats.rtt_ms is not None and 90 <= stats.rtt_ms < 160
+    assert stats.echo_max_ms is not None and 380 <= stats.echo_max_ms <= 420
+    assert stats.misses == 0
+
+
+async def test_blocking_supervision_unchanged_on_can():
+    """CAN keeps blocking supervision: attribute pin + the two-miss abort
+    behavior the existing pins already enforce still holds."""
+    assert CanRelayLink.supervision == "blocking"
+    assert CobsRelayLink.supervision == "async"
+    link = TimelineLink()  # never confirms
+    with pytest.raises(SendAborted):
+        await send_steps(
+            link, can_controller(link), [T],
+            [Step(True, 150), Step(False, 150)],
+            config=CONFIG, confirm=True, confirm_timeout=0.05,
+        )  # type: ignore[arg-type]

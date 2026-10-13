@@ -37,8 +37,14 @@ class RelayController(Protocol):
 
     ``write`` is write-ONLY — the executor owns pacing. ``current_state``
     snapshots the family's relay-state view for the executor's pre-send
-    capture (restores are keyed by ``target.key``).
+    capture (restores are keyed by ``target.key``). ``supervision`` says
+    whether the executor confirms BLOCKING inside each element's window
+    (CAN: the echo gates the next write) or ASYNCHRONOUS (data family:
+    writes never wait on the — possibly slow — RelayStatus echo; misses are
+    counted post-hoc and never abort).
     """
+
+    supervision: str
 
     async def ensure(self, target: LightTarget) -> bool: ...
 
@@ -71,6 +77,11 @@ def make_controller(link: GatewayLink, rc: RemoteControl | None) -> RelayControl
 
 class CobsRelayLink:
     """RelayController for legacy COBS gateways (data family)."""
+
+    # ASYNC supervision: the RelayStatus echo can lag ~0.5 s on real
+    # hardware — awaiting it inside an element's window would abort every
+    # fast send. The executor counts echoes post-hoc instead.
+    supervision = "async"
 
     def __init__(self, link: GatewayLink, builder: CommandBuilder | None = None) -> None:
         self._link = link
@@ -114,6 +125,10 @@ class CobsRelayLink:
 
 class CanRelayLink:
     """RelayController wrapping the existing CAN machinery (IDS-CAN family)."""
+
+    # BLOCKING supervision (unchanged): DEVICE_STATUS confirms inside each
+    # element's window gate the next write, two consecutive misses abort.
+    supervision = "blocking"
 
     def __init__(self, link: GatewayLink, rc: RemoteControl) -> None:
         self._link = link

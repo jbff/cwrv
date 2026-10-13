@@ -93,11 +93,18 @@ async def reconnect_gateway(link: GatewayLink, config: GatewayConfig) -> None:
 
 @dataclass
 class SendStats:
-    """Outcome of one send: confirm misses, restore failures, measured RTT."""
+    """Outcome of one send: confirm misses, restore failures, measured RTT.
+
+    ``rtt_ms`` is the FIRST confirmed echo's latency; ``echo_max_ms`` (data
+    family / async supervision only) is the maximum latency across ALL
+    confirmed echoes. On the data family the echo is supervisory only — it is
+    not used for the WPM advisory.
+    """
 
     rtt_ms: float | None = None
     misses: int = 0
     restore_failures: int = 0
+    echo_max_ms: float | None = None
 
 
 class SendAborted(RuntimeError):
@@ -127,6 +134,21 @@ async def send_steps(
     death — restores the pre-send state of every touched target (forced OFF
     when the pre-state was unknown). Writes go through the family
     :class:`RelayController`, one write per target.
+
+    Supervision mode comes from ``controller.supervision``:
+
+    * ``"blocking"`` (CAN): confirms are awaited inside each element's
+      window; two consecutive missed elements abort (off-guarantee).
+
+    * ``"async"`` (data family / COBS): after each element's write the
+      confirms are spawned as tasks and NOT awaited — the RelayStatus echo
+      can lag ~0.5 s and never gates when the next write happens. Finished
+      echo tasks are reaped non-blocking right before the next write and
+      their misses counted POST-HOC; there is NO SendAborted from echo lag
+      (a lagging echo cannot save the message, and the gateway may still
+      apply pending writes — report instead). At teardown, still-outstanding
+      echo tasks get one 0.5 s reap; unfinished ones at the deadline are
+      cancelled and counted as misses.
     """
     if not targets:
         raise ValueError("no devices to blink")
@@ -141,14 +163,46 @@ async def send_steps(
     start = time.monotonic()
     pos = 0.0
     consecutive_misses = 0
+    # Async supervision state (data family): one confirm task per
+    # (element, target); reaped non-blocking, post-hoc.
+    supervise_async = confirm and getattr(controller, "supervision", "blocking") == "async"
+    pending: list[asyncio.Task[bool]] = []
+    echo_latencies: list[float] = []
 
     async def confirm_one(target: LightTarget, on: bool) -> bool:
-        """Relay-state check that also captures the first confirmed latency."""
+        """Relay-state check that also captures confirmed echo latencies."""
         t0 = time.monotonic()
         ok = await controller.confirm(target, on, timeout=confirm_timeout)
-        if ok and stats.rtt_ms is None:
-            stats.rtt_ms = (time.monotonic() - t0) * 1000.0
+        if ok:
+            latency = (time.monotonic() - t0) * 1000.0
+            echo_latencies.append(latency)
+            if stats.rtt_ms is None:
+                stats.rtt_ms = latency
         return ok
+
+    def reap_done() -> None:
+        """Non-blocking reap of finished echo tasks; post-hoc miss counting.
+
+        Blocking only for exceptions (e.g. link loss), which surface through
+        the normal link-failure path. In async mode a reap NEVER aborts.
+        """
+        nonlocal consecutive_misses
+        done = [t for t in pending if t.done()]
+        pending[:] = [t for t in pending if not t.done()]
+        if not done:
+            return
+        for task in done:
+            exc = task.exception()
+            if exc is not None:
+                raise exc  # link errors flow into the reconnect path
+        oks = [task.result() for task in done]
+        if all(oks):
+            consecutive_misses = 0
+        else:
+            stats.misses += oks.count(False)
+            # NOTE: no SendAborted branch here — async supervision reports,
+            # it does not abort (echo lag cannot save the message anyway).
+            consecutive_misses += 1
 
     async def resume_sessions() -> None:
         """After a reconnect: reset controller state and rebuild per target.
@@ -174,7 +228,9 @@ async def send_steps(
                 ))
                 written = True
                 pos += step.ms  # AFTER the write: the first write is never delayed
-                if confirm:
+                if confirm and not supervise_async:
+                    # BLOCKING supervision (CAN): the echo gates the rewrite
+                    # decision inside the element's window.
                     confirmed = await asyncio.gather(*(
                         confirm_one(t, step.on) for t in targets
                     ))
@@ -192,6 +248,13 @@ async def send_steps(
                             raise SendAborted(
                                 "two consecutive steps unconfirmed; aborting"
                             )
+                elif supervise_async:
+                    # ASYNC supervision (data family): spawn the echoes, never
+                    # wait — they are reaped post-hoc before the next write.
+                    pending.extend(
+                        asyncio.create_task(confirm_one(t, step.on))
+                        for t in targets
+                    )
             except _LINK_ERRORS as exc:
                 link_failures += 1
                 if link_failures > 1:
@@ -209,8 +272,34 @@ async def send_steps(
             delay = start + pos / 1000.0 - time.monotonic()
             if delay > 0:
                 await asyncio.sleep(delay)
+            if supervise_async:
+                reap_done()
             index += 1
     finally:
+        # Reap the outstanding echoes (async mode) BEFORE the restore writes:
+        # the restore must not race un-acked elements' state reporting.
+        if pending:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True), timeout=0.5
+                )
+            except TimeoutError:
+                # unfinished at the deadline: counted as misses, tasks cancelled
+                for task in pending:
+                    if not task.done():
+                        task.cancel()
+            for task in pending:
+                ok = (
+                    task.done()
+                    and not task.cancelled()
+                    and task.exception() is None
+                    and task.result() is True
+                )
+                if not ok:
+                    stats.misses += 1
+            pending.clear()
+        if supervise_async:
+            stats.echo_max_ms = max(echo_latencies) if echo_latencies else None
         for t in targets:
             state = pre.get(t.key)
             state = state if state is not None else False

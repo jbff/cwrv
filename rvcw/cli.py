@@ -80,6 +80,13 @@ def _parse_device_id(_ctx, _param, value: str | None) -> int | None:
         ) from None
 
 
+def _echo_line(stats) -> None:
+    """Data-family echo report (the echo is supervisory; no WPM advisory)."""
+    first = f"{stats.rtt_ms:.0f}ms" if stats.rtt_ms is not None else "n/a"
+    echo_max = f"{stats.echo_max_ms:.0f}ms" if stats.echo_max_ms is not None else "n/a"
+    click.echo(f"echoes: first={first} max={echo_max}")
+
+
 @cli.command()
 @click.argument("text")
 @click.option("--light", required=True, help="light or combo name from lights.toml")
@@ -122,7 +129,7 @@ def send(text: str, light: str, wpm: int | None, repeat: int, dry_run: bool, no_
 
     confirm_timeout = max(0.05, (1200 / wpm) / 1000 * 0.8)
 
-    async def run_live() -> SendStats:
+    async def run_live() -> tuple[SendStats, bool]:
         cfg = load_gateway()
         async with open_gateway(cfg) as (link, rc):
             if rc is None and not force_table:
@@ -132,16 +139,19 @@ def send(text: str, light: str, wpm: int | None, repeat: int, dry_run: bool, no_
                         "send refused — pass --force-table to blink anyway"
                     )
             controller = make_controller(link, rc)
-            return await send_steps(
-                link, controller, _targets(entries), steps,
-                config=cfg,
-                confirm=not no_confirm,
-                confirm_timeout=confirm_timeout,
+            return (
+                await send_steps(
+                    link, controller, _targets(entries), steps,
+                    config=cfg,
+                    confirm=not no_confirm,
+                    confirm_timeout=confirm_timeout,
+                ),
+                rc is None,  # data family?
             )
 
     try:
         click.echo("connecting…")
-        stats = asyncio.run(run_live())
+        stats, used_data_family = asyncio.run(run_live())
     except TableMismatch as exc:
         click.echo(str(exc), err=True)
         raise SystemExit(1) from None
@@ -150,7 +160,11 @@ def send(text: str, light: str, wpm: int | None, repeat: int, dry_run: bool, no_
     ) as exc:
         click.echo(f"aborted: {exc}", err=True)
         raise SystemExit(1) from None
-    if stats.rtt_ms is not None and stats.rtt_ms > 0:
+    if used_data_family:
+        # Data family: the RelayStatus echo is supervisory only (it can lag
+        # far beyond a dit) — report echoes, SKIP the WPM advisory.
+        _echo_line(stats)
+    elif stats.rtt_ms is not None and stats.rtt_ms > 0:
         max_wpm = int(1200 / max(stats.rtt_ms / 0.60, 1.0))
         if wpm > max_wpm:
             click.echo(
@@ -173,7 +187,7 @@ def selftest(light: str) -> None:
     from .ble.transport import GatewayAuthError, LinkError
     from .executor import SendAborted, SendStats, open_gateway, send_steps
 
-    async def run() -> SendStats:
+    async def run() -> tuple[SendStats, bool]:
         cfg = load_gateway()
         async with open_gateway(cfg) as (link, rc):
             if rc is None:
@@ -181,18 +195,23 @@ def selftest(light: str) -> None:
                 # hear/see whether anything blinks at all
                 _check_mismatch(link, {e.table_id for e in entries}, light)
             controller = make_controller(link, rc)
-            return await send_steps(
-                link, controller, _targets(entries), steps, config=cfg, confirm=True
+            return (
+                await send_steps(
+                    link, controller, _targets(entries), steps, config=cfg, confirm=True
+                ),
+                rc is None,  # data family?
             )
 
     try:
-        stats = asyncio.run(run())
+        stats, used_data_family = asyncio.run(run())
     except (
         SendAborted, RemoteControlSessionError, LinkError, GatewayAuthError
     ) as exc:
         click.echo(f"selftest FAILED: {exc}", err=True)
         raise SystemExit(1) from None
     click.echo(f"selftest OK: misses={stats.misses} rtt_ms={stats.rtt_ms}")
+    if used_data_family:
+        _echo_line(stats)
     click.echo("check the physical light returned to its prior state now")
 
 
