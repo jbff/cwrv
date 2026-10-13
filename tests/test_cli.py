@@ -316,3 +316,135 @@ def test_sniff_formatter_highlights_relay_and_gateway_rows():
 
     other = cli._describe_data_event(bytes([0x07, 0x00, 0x0B]))
     assert "RV" in other or "0x07" in other  # decoded, never a crash
+
+
+# ---- review fix 3: saved-table vs announced-table mismatch is loud ----------
+
+
+class EchoDataLink(FakeDataLink):
+    """FakeDataLink whose switch writes echo the relay state (runs a schedule)."""
+
+    def __init__(self, mac, pin=None):
+        super().__init__(mac, pin)
+        self.relay_states = {}
+        self.sent_to_relay = False
+
+    async def send_command(self, raw: bytes) -> None:
+        self.commands.append(raw)
+        self.sent_to_relay = True
+        for d in raw[5:]:
+            self.relay_states[(raw[3], d)] = raw[4] == 0x01
+
+
+def _byte_device_fixture(rvcw_home) -> None:
+    """Live-send tests need a data-plausible (single-byte) device id:
+    build_action_switch masks device ids to one byte on the COBS path."""
+    (rvcw_home / "lights.toml").write_text(
+        "[lights.awning]\ntable = 0x00\ndevice = 0x2E\n"
+    )
+
+
+def _install_data_gateway(monkeypatch, link_holder: dict, gateway_link_cls):
+    import rvcw.executor as executor_mod
+
+    @asynccontextmanager
+    async def fake_open(config, observed=None):
+        link = gateway_link_cls("AA:BB")
+        link_holder["link"] = link
+        yield link, None
+
+    monkeypatch.setattr(executor_mod, "open_gateway", fake_open)
+
+
+def test_send_refuses_table_mismatch_unless_forced(rvcw_home, monkeypatch):
+    """Fixture maps awning to table 0x00; the gateway announces 0x02."""
+    from rvcw.cli import cli
+
+    _byte_device_fixture(rvcw_home)
+    holder: dict = {}
+    _install_data_gateway(monkeypatch, holder, EchoDataLink)
+
+    result = CliRunner().invoke(cli, ["send", "E", "--light", "awning"])
+    assert result.exit_code == 1, result.output
+    assert "warning" in result.output
+    assert "0x00" in result.output and "0x02" in result.output
+    assert "awning" in result.output
+    assert "--force-table" in result.output
+    assert holder["link"].sent_to_relay is False  # nothing was sent
+
+    result = CliRunner().invoke(cli, ["send", "E", "--light", "awning", "--force-table"])
+    assert result.exit_code == 0, result.output
+    assert "sent" in result.output
+    assert holder["link"].sent_to_relay is True
+
+
+def test_send_table_match_sends_without_force(rvcw_home, monkeypatch):
+    from rvcw.cli import cli
+
+    _byte_device_fixture(rvcw_home)
+    holder: dict = {}
+
+    class MatchedLink(EchoDataLink):
+        def __init__(self, mac, pin=None):
+            super().__init__(mac, pin)
+            from rvcw.protocol.events import GatewayInformation
+
+            self.gateway_info = GatewayInformation(table_id=0x00)
+
+    _install_data_gateway(monkeypatch, holder, MatchedLink)
+
+    result = CliRunner().invoke(cli, ["send", "E", "--light", "awning"])
+    assert result.exit_code == 0, result.output
+    assert "sent" in result.output
+
+
+def test_selftest_warns_on_table_mismatch_but_runs(rvcw_home, monkeypatch):
+    from rvcw.cli import cli
+
+    _byte_device_fixture(rvcw_home)
+    holder: dict = {}
+    _install_data_gateway(monkeypatch, holder, EchoDataLink)
+
+    result = CliRunner().invoke(cli, ["selftest", "--light", "awning"])
+    assert result.exit_code == 0, result.output
+    assert "warning" in result.output
+    assert "table 0x00" in result.output and "0x02" in result.output
+    assert "selftest OK" in result.output
+
+
+def test_learn_data_family_warns_when_candidate_table_differs(rvcw_home, monkeypatch):
+    from rvcw import cli as cli_mod
+    import rvcw.discovery as discovery_mod
+    import rvcw.executor as executor_mod
+
+    holder: dict = {}
+
+    @asynccontextmanager
+    async def fake_open(config, observed=None):
+        link = EchoDataLink("AA:BB")
+        holder["link"] = link
+        yield link, None
+
+    monkeypatch.setattr(executor_mod, "open_gateway", fake_open)
+
+    async def fake_collect_relay_states(glink, table, window_s=3.0):
+        glink.relay_states = {(0x01, 0x2E): False}  # announced table is 0x02
+        return dict(glink.relay_states)
+
+    monkeypatch.setattr(discovery_mod, "collect_relay_states", fake_collect_relay_states)
+
+    real_sleep = asyncio.sleep
+
+    async def quick_sleep(delay, *args, **kwargs):
+        await real_sleep(min(delay, 0.01))
+
+    monkeypatch.setattr(cli_mod.asyncio, "sleep", quick_sleep)
+
+    from rvcw.cli import cli
+
+    result = CliRunner().invoke(cli, ["learn", "awning", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert "warning" in result.output
+    assert "0x01" in result.output and "0x02" in result.output
+    saved = (rvcw_home / "lights.toml").read_text()
+    assert "table = 0x01" in saved  # the OBSERVED relay table is what gets saved

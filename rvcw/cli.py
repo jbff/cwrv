@@ -21,6 +21,35 @@ def cli() -> None:
     """Blink CW (Morse) messages on RV panel lights."""
 
 
+class TableMismatch(RuntimeError):
+    """A saved light's device table differs from the announced one (data path)."""
+
+
+def _check_mismatch(link, tables: set[int], light: str) -> bool:
+    """Data-family guard: is any mapped/saved table NOT the announced one?
+
+    Prints a warning naming the light, the saved table(s) and the announced
+    table, and returns False on mismatch. Non-data links and links without a
+    gateway announcement always pass. Warn-only callers (selftest, learn)
+    treat False as informational; `send` refuses unless --force-table.
+    """
+    if link_family(link) != "data":
+        return True
+    info = getattr(link, "gateway_info", None)
+    if info is None:
+        return True
+    wrong = tables - {info.table_id}
+    if not wrong:
+        return True
+    saved = ", ".join(f"0x{t:02X}" for t in sorted(wrong))
+    click.echo(
+        f"warning: light '{light}' is mapped to table {saved} but the gateway "
+        f"announced table 0x{info.table_id:02X}",
+        err=True,
+    )
+    return False
+
+
 def _resolve(
     text: str, light: str, wpm: int, repeat: int
 ) -> tuple[list[morse.Step], list[LightEntry]]:
@@ -60,7 +89,12 @@ def _parse_device_id(_ctx, _param, value: str) -> int:
     is_flag=True,
     help="skip relay-state waiting (if status parsing failed)",
 )
-def send(text: str, light: str, wpm: int | None, repeat: int, dry_run: bool, no_confirm: bool) -> None:
+@click.option(
+    "--force-table",
+    is_flag=True,
+    help="blink even when the light's saved table differs from the announced one",
+)
+def send(text: str, light: str, wpm: int | None, repeat: int, dry_run: bool, no_confirm: bool, force_table: bool) -> None:
     """Blink TEXT as CW on the requested light."""
     if wpm is None:
         wpm = load_gateway().wpm
@@ -89,6 +123,12 @@ def send(text: str, light: str, wpm: int | None, repeat: int, dry_run: bool, no_
     async def run_live() -> SendStats:
         cfg = load_gateway()
         async with open_gateway(cfg) as (link, rc):
+            if rc is None and not force_table:
+                mapped = {e.table_id for e in entries}
+                if not _check_mismatch(link, mapped, light):
+                    raise TableMismatch(
+                        "send refused — pass --force-table to blink anyway"
+                    )
             controller = make_controller(link, rc)
             return await send_steps(
                 link, controller, _targets(entries), steps,
@@ -100,6 +140,9 @@ def send(text: str, light: str, wpm: int | None, repeat: int, dry_run: bool, no_
     try:
         click.echo("connecting…")
         stats = asyncio.run(run_live())
+    except TableMismatch as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(1) from None
     except (SendAborted, RemoteControlSessionError, LinkError) as exc:
         click.echo(f"aborted: {exc}", err=True)
         raise SystemExit(1) from None
@@ -128,6 +171,10 @@ def selftest(light: str) -> None:
     async def run() -> SendStats:
         cfg = load_gateway()
         async with open_gateway(cfg) as (link, rc):
+            if rc is None:
+                # warn-only: the selftest should still run so the operator can
+                # hear/see whether anything blinks at all
+                _check_mismatch(link, {e.table_id for e in entries}, light)
             controller = make_controller(link, rc)
             return await send_steps(
                 link, controller, _targets(entries), steps, config=cfg, confirm=True
@@ -421,6 +468,9 @@ def learn(name: str, yes: bool) -> None:
                     except Exception:
                         pass  # link is gone; nothing to command anymore
                 if yes or click.confirm(f"Was that {name}?"):
+                    # the OBSERVED relay table is what gets saved; if it differs
+                    # from the announced table, say so loudly (warn-only)
+                    _check_mismatch(link, {table_id}, name)
                     lights.save_light(lights_path(), name, table_id, device_id)
                     click.echo(
                         f"saved: {name} = table 0x{table_id:02X} device "

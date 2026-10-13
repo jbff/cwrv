@@ -388,3 +388,63 @@ async def test_failed_reconnect_raises_immediately(monkeypatch):
         await send_steps(
             link, can_controller(link), [T], [Step(True, 100)], config=CONFIG, confirm=False
         )
+
+
+# ---- data family reconnect through the REAL reconnect_gateway path ----------
+
+
+class FlakyDataLink(DataTimelineLink):
+    """Drops link-level (`LinkError`) after `budget` successful commands until
+    the real reconnect_gateway re-establishes it (connect clears `down`)."""
+
+    family = "data"
+    pin = "1234"
+
+    def __init__(self, budget: int):
+        super().__init__()
+        self.budget = budget
+        self.down = True
+        self.closes = 0
+        self.auths = 0
+
+    async def send_command(self, raw: bytes) -> None:
+        if self.budget > 0:
+            self.budget -= 1
+        elif self.down:
+            raise LinkError("mid-schedule BLE loss")
+        await super().send_command(raw)
+
+    async def connect(self) -> None:
+        self.down = False
+
+    async def close(self) -> None:
+        self.closes += 1
+
+    async def authenticate_data(self, pin) -> None:
+        assert pin == "1234"
+        self.auths += 1
+
+    async def start_keepalive(self) -> None:
+        pass
+
+
+async def test_data_family_reconnects_once_and_resumes_remaining_schedule():
+    """The COBS data path resumes exactly like CAN: ONE close + ONE
+    authenticate_data re-auth, resume at the current schedule position (no
+    element repeats, no early write after the resume), restore still runs."""
+    link = FlakyDataLink(budget=2)  # steps 1-2 write ok; step 3's write raises
+    controller = CobsRelayLink(link)  # type: ignore[arg-type]
+    steps = [Step(True, 100), Step(False, 100), Step(True, 100)]
+
+    stats = await send_steps(
+        link, controller, [LightTarget(0x01, 0x2E)], steps,
+        config=CONFIG, confirm=False,
+    )  # type: ignore[arg-type]
+
+    assert link.closes == 1  # exactly one close()
+    assert link.auths == 1  # and exactly one authenticate_data re-auth
+    # each element written exactly once + restore (pre-state unknown -> OFF)
+    assert [raw[4] for _t, raw in link.commands] == [0x01, 0x00, 0x01, 0x00]
+    # resumed at the CURRENT position: the retried element is not re-sequenced
+    assert link.commands[2][0] < 0.25
+    assert stats.restore_failures == 0

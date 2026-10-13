@@ -22,7 +22,8 @@ Two gateway families are supported: legacy MyRvLink COBS panels (UNLOCK/SEED
 auth; relays addressed as `table` + `device`) and IDS-CAN panels (DEVICE_STATUS
 status; relays addressed by participant id). `learn` writes `lights.toml`
 with both halves; old `device_id = …` entries are rejected at load — re-run
-`learn`.
+`learn`. Lights learned on a CAN-family gateway carry `table = 0x00`
+("unknown table"); that only matters when re-learning for another family.
 
 Then:
 
