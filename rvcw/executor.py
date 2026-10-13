@@ -183,8 +183,12 @@ async def send_steps(
     def reap_done() -> None:
         """Non-blocking reap of finished echo tasks; post-hoc miss counting.
 
-        Blocking only for exceptions (e.g. link loss), which surface through
-        the normal link-failure path. In async mode a reap NEVER aborts.
+        NOTE: a confirm-task exception is re-raised DIRECTLY (abort) — it does
+        NOT flow into the reconnect path below, because `reap_done()` runs
+        AFTER that try/except. That is safe in practice: neither controller's
+        `confirm` raises on a healthy link (a dead link makes the writes, not
+        the confirms, raise), and confirm-poll misses are counted as misses,
+        never raised.
         """
         nonlocal consecutive_misses
         done = [t for t in pending if t.done()]
@@ -194,7 +198,7 @@ async def send_steps(
         for task in done:
             exc = task.exception()
             if exc is not None:
-                raise exc  # link errors flow into the reconnect path
+                raise exc  # aborts the send (NOT via the reconnect handler)
         oks = [task.result() for task in done]
         if all(oks):
             consecutive_misses = 0
@@ -285,9 +289,13 @@ async def send_steps(
                 )
             except TimeoutError:
                 # unfinished at the deadline: counted as misses, tasks cancelled
-                for task in pending:
-                    if not task.done():
-                        task.cancel()
+                cancelled = [task for task in pending if not task.done()]
+                for task in cancelled:
+                    task.cancel()
+                if cancelled:
+                    # join the cancellations so no task outlives send_steps
+                    # (a GC'd still-pending task would log "Task was destroyed")
+                    await asyncio.gather(*cancelled, return_exceptions=True)
             for task in pending:
                 ok = (
                     task.done()

@@ -537,3 +537,29 @@ async def test_blocking_supervision_unchanged_on_can():
             [Step(True, 150), Step(False, 150)],
             config=CONFIG, confirm=True, confirm_timeout=0.05,
         )  # type: ignore[arg-type]
+
+
+# ---- follow-up #3 -----------------------------------------------------------
+
+
+async def test_finally_reap_deadline_cancels_stragglers_and_runs_restore(caplog):
+    """Echoes that can never resolve: the finally's 0.5 s reap deadline fires
+    (NOT the confirm timeout), stragglers are cancelled AND counted as misses,
+    the restore still runs promptly, and no 'Task was destroyed' warning is
+    logged (cancelled tasks are joined, none outlives send_steps)."""
+    import logging as logging_mod
+
+    link = DataTimelineLink(confirm_on_write=False)  # echo never arrives
+    # confirm_timeout=5.0 proves the finally reaps at 0.5 s, not this window
+    t0 = time.monotonic()
+    with caplog.at_level(logging_mod.ERROR, logger="asyncio"):
+        stats = await send_steps(
+            link, CobsRelayLink(link), [T_DATA], [Step(True, 100)],
+            config=CONFIG, confirm=True, confirm_timeout=5.0,
+        )  # type: ignore[arg-type]
+    elapsed = time.monotonic() - t0
+    assert elapsed < 1.5  # restore NOT delayed by the 5 s confirm window
+    assert stats.misses == 1  # the straggler was counted as a miss
+    assert stats.restore_failures == 0
+    assert len(link.commands) == 2  # element + restore
+    assert not any("Task was destroyed" in r.message for r in caplog.records)

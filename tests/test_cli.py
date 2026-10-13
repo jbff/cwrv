@@ -612,3 +612,47 @@ def test_send_data_family_reports_echoes_and_skips_wpm_advisory(rvcw_home, monke
     assert match is not None, result.output
     assert int(match.group(1)) >= 150  # the reported echo latency is real
     assert "suggests" not in result.output  # the WPM advisory is SKIPPED
+
+
+def test_learn_device_option_saves_without_prompting(rvcw_home, monkeypatch):
+    """--device is the non-interactive driver mode: NO --yes needed — the
+    candidate matching the device id is toggled and saved with no prompt
+    consumed (stdin stays closed)."""
+    from rvcw import cli as cli_mod
+    import rvcw.discovery as discovery_mod
+    import rvcw.executor as executor_mod
+
+    from rvcw.cli import cli
+
+    holder: dict = {}
+
+    @asynccontextmanager
+    async def fake_open(config, observed=None):
+        link = EchoDataLink("AA:BB")
+        holder["link"] = link
+        yield link, None
+
+    monkeypatch.setattr(executor_mod, "open_gateway", fake_open)
+
+    async def fake_collect_relay_states(glink, table, window_s=3.0):
+        glink.relay_states = {(0x02, 0x2E): False, (0x02, 0x09): False}
+        return dict(glink.relay_states)
+
+    monkeypatch.setattr(discovery_mod, "collect_relay_states", fake_collect_relay_states)
+
+    real_sleep = asyncio.sleep
+
+    async def quick_sleep(delay, *args, **kwargs):
+        await real_sleep(min(delay, 0.01))
+
+    monkeypatch.setattr(cli_mod.asyncio, "sleep", quick_sleep)
+
+    # NO --yes, NO stdin: a prompt here would abort the invocation
+    result = CliRunner().invoke(cli, ["learn", "x", "--device", "0x09"])
+    assert result.exit_code == 0, result.output
+    assert "saved: x" in result.output
+    saved = (rvcw_home / "lights.toml").read_text()
+    assert "table = 0x02" in saved and "device = 0x0009" in saved
+    # only the matching device id was toggled (OFF, ON, finally-OFF)
+    switches = [(raw[3], raw[5], raw[4] == 0x01) for raw in holder["link"].commands]
+    assert switches == [(0x02, 0x09, False), (0x02, 0x09, True), (0x02, 0x09, False)]

@@ -453,7 +453,8 @@ def discover() -> None:
 @click.option(
     "--device",
     callback=_parse_device_id,
-    help="non-interactive: toggle/save only this device id (use with --yes)",
+    help="non-interactive: toggle and save only this device id "
+    "(no prompt; implied --yes)",
 )
 def learn(name: str, yes: bool, device: int | None) -> None:
     """Guided toggle-and-observe mapping: NAME gets a relay from candidates."""
