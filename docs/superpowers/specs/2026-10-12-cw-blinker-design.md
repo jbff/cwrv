@@ -1,8 +1,34 @@
 # CW (Morse) blinker for RV panel lights — design
 
-Date: 2026-10-12
+Date: 2026-10-12; **route amended 2026-10-13 — legacy MyRvLink COBS** (see "Route amendment")
 Repo: https://github.com/jbff/cwrv (public, `main`)
-Status: approved in chat 2026-10-12; awaiting spec review
+Status: implemented (IDS-CAN build merged); legacy-COBS re-route in progress
+
+## Route amendment (2026-10-13, from live GATT evidence)
+
+Full stable GATT enumeration (3 fresh connections) shows this gateway —
+`10:06:1C:E7:B8:3E', HA config entry `gateway_family: "legacy"` — has NO
+IDS-CAN characteristics (no CAN_WRITE 00000001 / CAN_READ 00000002 /
+CAN_VERSION / PASSWORD_UNLOCK). What it exposes:
+
+- auth service `00000010-0200-a58e-e411-afe28044e62c`: UNLOCK_STATUS `0x12`
+  (read), SEED `0x11` (read+notify), `0x14` (read+notify), KEY `0x13` (write)
+- data service `00000030-…`: data write `0x33` (write), DATA_READ `0x34`
+  (read+notify), probe char `0x31` (read)
+
+This is the **MyRvLink COBS family**: `CMD_ACTION_SWITCH` (0x40) /
+`CMD_ACTION_DIMMABLE` (0x43) frames, COBS-encoded, written to the data-write
+char; events stream back on DATA_READ (`0x02` DEVICE_COMMAND metadata,
+`0x05`/`0x06` RelayBasicLatching = the relay feedback for state-confirmed
+pacing); auth = step-1 UNLOCK_STATUS→KEY + step-2 SEED→16-byte
+KEY (`calculate_step2_key(seed, gateway_pin)`) — already vendored.
+
+The IDS-CAN layers (LocalHost claim, REMOTE_CONTROL sessions, 0x82 commands)
+are inert for this device and retained for other gateway families. The
+executor, off-guarantee, morse engine, lights/combos mapping, and CLI are
+transport-agnostic and carry over unchanged. The briefing's "GATT discovery
+missing CAN_WRITE" note is hereby re-interpreted: not an enumeration
+quirk — the characteristics do not exist on this gateway.
 
 ## Purpose
 
