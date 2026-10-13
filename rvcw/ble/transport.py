@@ -89,13 +89,28 @@ class GatewayLink:
         return self._client
 
     async def connect(self) -> None:
-        client = BleakClient(self.mac)
-        await client.connect()
-        try:
-            if hasattr(client, "request_mtu"):
-                await client.request_mtu(185)  # best-effort, as upstream does
-        except Exception:
-            pass
+        """Connect with service-discovery retries (upstream parity: the panel's
+        GATT sometimes reports an incomplete service set right after connect —
+        HA's boot log showed the same "missing CAN_WRITE" quirk)."""
+        required = (CAN_READ_CHAR_UUID, CAN_WRITE_CHAR_UUID)
+        client: BleakClient | None = None
+        for attempt in range(3):
+            client = BleakClient(self.mac)
+            await client.connect()
+            try:
+                if hasattr(client, "request_mtu"):
+                    await client.request_mtu(185)  # best-effort, as upstream does
+            except Exception:
+                pass
+            chars = {c.uuid for s in client.services for c in s.characteristics}
+            if all(u in chars for u in required):
+                break
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        assert client is not None
         self._client = client
         await client.start_notify(
             CAN_READ_CHAR_UUID,
